@@ -30,6 +30,17 @@ class Settings(BaseSettings):
     # (Paystack signs with the secret key), but kept for clarity.
     PAYSTACK_WEBHOOK_SECRET: str = ""
 
+    # --- Auth ---
+    # Super admin is bootstrapped at startup from these values (see
+    # app/core/init_superadmin.py). No super admin is created if they are blank.
+    SUPER_ADMIN_EMAIL: str = ""
+    SUPER_ADMIN_PASSWORD: str = ""
+
+    # JWT signing.
+    JWT_SECRET_KEY: str = ""
+    JWT_ALGORITHM: str = "HS256"
+    ACCESS_TOKEN_EXPIRE_MINUTES: int = 60 * 24  # 24h by default
+
     # CORS
     CORS_ORIGINS: list[str] = Field(default_factory=lambda: ["http://localhost:3000"])
 

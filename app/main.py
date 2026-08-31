@@ -13,11 +13,14 @@ from app.core.config import settings
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Optionally auto-create tables for local dev. Use Alembic in production.
-    if settings.ENVIRONMENT in {"development", "test"}:
-        from app.core.database import init_db
+    # Schema is managed by Alembic migrations (alembic upgrade head) — see the
+    # migrations in alembic/versions/. Here we only ensure the super admin from
+    # .env exists (idempotent, skipped if env values are blank).
+    from app.core.database import AsyncSessionLocal
+    from app.core.init_superadmin import ensure_superadmin
 
-        # await init_db()
+    async with AsyncSessionLocal() as session:
+        await ensure_superadmin(session)
     yield
 
 

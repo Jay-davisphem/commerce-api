@@ -60,6 +60,14 @@ class Order(Base, TimestampMixin):
     # Guest checkout identity — required, no auth required.
     guest_email: Mapped[str] = mapped_column(String(255), nullable=False, index=True)
 
+    # Optional link to a User account. NULL for pure guest checkout; set when the
+    # buyer is authenticated (or linked after registration by matching email).
+    user_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("users.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
+
     # Delivery details (snapshot).
     delivery_recipient_name: Mapped[str | None] = mapped_column(String(255), nullable=True)
     delivery_phone: Mapped[str | None] = mapped_column(String(50), nullable=True)
@@ -115,6 +123,9 @@ class Order(Base, TimestampMixin):
         lazy="selectin",
     )
 
+    # The User who placed this order, if the guest later created/attached an account.
+    user: Mapped["User | None"] = relationship(back_populates="orders")
+
     def __repr__(self) -> str:
         return (
             f"<Order id={self.id} email={self.guest_email!r} "
@@ -123,3 +134,4 @@ class Order(Base, TimestampMixin):
 
 
 from app.models.order_item import OrderItem  # noqa: E402
+from app.models.user import User  # noqa: E402

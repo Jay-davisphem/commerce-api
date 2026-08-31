@@ -8,7 +8,6 @@ from pydantic import BaseModel, ConfigDict, EmailStr, Field
 
 from app.models.order import OrderStatus, PaymentStatus
 
-
 # -------------------------------
 # Request side (one-shot checkout)
 # -------------------------------
@@ -39,10 +38,19 @@ class CheckoutItem(BaseModel):
 
 
 class CheckoutRequest(BaseModel):
-    """The single payload the frontend posts to the checkout endpoint."""
+    """The single payload the frontend posts to the checkout endpoint.
 
-    guest_email: EmailStr
-    delivery: DeliveryAddress
+    `guest_email` is optional when a logged-in buyer checks out — the server
+    derives the order email from the authenticated account then. It is required
+    for guest checkout.
+
+    `delivery` is optional when a logged-in buyer chooses to use their saved
+    address (`use_saved_address=True`). Guests must always supply `delivery`.
+    """
+
+    guest_email: EmailStr | None = None
+    delivery: DeliveryAddress | None = None
+    use_saved_address: bool = False
     items: list[CheckoutItem] = Field(min_length=1)
 
 

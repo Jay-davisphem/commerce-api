@@ -11,6 +11,14 @@ from app.schemas.order import (
 )
 from app.schemas.paystack import PaystackEventData, PaystackWebhook, PaymentVerification
 from app.schemas.product import ProductCreate, ProductRead, ProductUpdate
+from app.schemas.user import (
+    DeliveryDetailsUpdate,
+    LoginRequest,
+    TokenResponse,
+    UserCreate,
+    UserRead,
+    UserRegister,
+)
 
 __all__ = [
     "DeliveryAddress",
@@ -26,4 +34,10 @@ __all__ = [
     "ProductCreate",
     "ProductRead",
     "ProductUpdate",
+    "LoginRequest",
+    "TokenResponse",
+    "UserCreate",
+    "UserRead",
+    "UserRegister",
+    "DeliveryDetailsUpdate",
 ]
