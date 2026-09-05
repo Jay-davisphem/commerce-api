@@ -6,6 +6,7 @@ from datetime import datetime
 from decimal import Decimal
 
 from sqlalchemy import (
+    CheckConstraint,
     DateTime,
     Enum,
     ForeignKey,
@@ -13,8 +14,6 @@ from sqlalchemy import (
     Numeric,
     String,
     Text,
-    CheckConstraint,
-    func,
 )
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -22,16 +21,19 @@ from app.models.base import Base, TimestampMixin
 
 
 class OrderStatus(str, enum.Enum):
-    """Lifecycle of an order in the one-shot checkout flow."""
+    """Lifecycle of an order in the checkout & delivery flow."""
 
-    PENDING = "pending"   # Created; waiting for Paystack payment confirmation.
-    PAID = "paid"         # Paystack webhook confirmed `charge.success`.
-    FAILED = "failed"     # Payment failed or expired.
+    PENDING = "pending"
+    PAID = "paid"
+    IN_ESCROW = "in_escrow"
+    IN_TRANSIT = "in_transit"
+    DELIVERED = "delivered"
+    FAILED = "failed"
     CANCELLED = "cancelled"
 
 
 class PaymentStatus(str, enum.Enum):
-    """Finer-grained payment tracking, separate from overall order status."""
+    """Payment tracking separate from delivery status."""
 
     UNPAID = "unpaid"
     PAID = "paid"
@@ -39,12 +41,7 @@ class PaymentStatus(str, enum.Enum):
 
 
 class Order(Base, TimestampMixin):
-    """A customer order placed through the one-shot checkout endpoint.
-
-    Supports guest checkout (no user/auth required). Carries the guest email,
-    a snapshot of the delivery address, the server-computed total, payment
-    status, and the Paystack transaction reference.
-    """
+    """A customer order placed through checkout or registered at POS."""
 
     __tablename__ = "orders"
     __table_args__ = (
@@ -56,19 +53,13 @@ class Order(Base, TimestampMixin):
     )
 
     id: Mapped[uuid.UUID] = mapped_column(primary_key=True, default=uuid.uuid4)
-
-    # Guest checkout identity — required, no auth required.
     guest_email: Mapped[str] = mapped_column(String(255), nullable=False, index=True)
-
-    # Optional link to a User account. NULL for pure guest checkout; set when the
-    # buyer is authenticated (or linked after registration by matching email).
     user_id: Mapped[uuid.UUID | None] = mapped_column(
         ForeignKey("users.id", ondelete="SET NULL"),
         nullable=True,
         index=True,
     )
 
-    # Delivery details (snapshot).
     delivery_recipient_name: Mapped[str | None] = mapped_column(String(255), nullable=True)
     delivery_phone: Mapped[str | None] = mapped_column(String(50), nullable=True)
     delivery_address_line1: Mapped[str] = mapped_column(String(255), nullable=False)
@@ -77,12 +68,9 @@ class Order(Base, TimestampMixin):
     delivery_state: Mapped[str | None] = mapped_column(String(120), nullable=True)
     delivery_postal_code: Mapped[str | None] = mapped_column(String(30), nullable=True)
     delivery_country: Mapped[str] = mapped_column(String(120), nullable=False)
-    # Catch-all for curated/non-standard delivery notes (e.g. landmark).
     delivery_notes: Mapped[str | None] = mapped_column(Text, nullable=True)
 
-    # Server-computed total for the whole order (sum of line totals).
     total_amount: Mapped[Decimal] = mapped_column(Numeric(12, 2), nullable=False)
-
     status: Mapped[OrderStatus] = mapped_column(
         Enum(OrderStatus, name="order_status"),
         default=OrderStatus.PENDING,
@@ -95,36 +83,38 @@ class Order(Base, TimestampMixin):
         nullable=False,
     )
 
-    # Paystack transaction reference. Unique-ish (we index it and enforce a
-    # partial uniqueness pattern in a real migration); used by the webhook to
-    # locate this order when `charge.success` arrives.
-    paystack_reference: Mapped[str | None] = mapped_column(
-        String(255),
-        nullable=True,
+    order_source: Mapped[str] = mapped_column(
+        String(20),
+        default="ONLINE",
+        nullable=False,
+        server_default="ONLINE",
     )
-    # Paystack access_code used to open the checkout modal on the frontend.
+
+    paystack_reference: Mapped[str | None] = mapped_column(String(255), nullable=True)
     paystack_access_code: Mapped[str | None] = mapped_column(String(255), nullable=True)
-    # Optional link to the authorization_url we returned to the client.
-    paystack_authorization_url: Mapped[str | None] = mapped_column(
-        String(1024),
-        nullable=True,
-    )
+    paystack_authorization_url: Mapped[str | None] = mapped_column(String(1024), nullable=True)
+    paid_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
-    # When the payment was confirmed (set by the webhook).
-    paid_at: Mapped[datetime | None] = mapped_column(
-        DateTime(timezone=True),
-        nullable=True,
-    )
-
-    # Line items, populated by the checkout service.
     items: Mapped[list["OrderItem"]] = relationship(
         back_populates="order",
         cascade="all, delete-orphan",
         lazy="selectin",
     )
+    user: Mapped["User | None"] = relationship(back_populates="orders", lazy="joined")
 
-    # The User who placed this order, if the guest later created/attached an account.
-    user: Mapped["User | None"] = relationship(back_populates="orders")
+    @property
+    def order_reference(self) -> str:
+        if self.paystack_reference:
+            return self.paystack_reference
+        return f"#BLHMI-{str(self.id)[:8].upper()}"
+
+    @property
+    def customer_name(self) -> str:
+        if self.delivery_recipient_name:
+            return self.delivery_recipient_name
+        if self.user and self.user.full_name:
+            return self.user.full_name
+        return "Customer"
 
     def __repr__(self) -> str:
         return (

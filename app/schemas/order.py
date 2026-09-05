@@ -8,13 +8,8 @@ from pydantic import BaseModel, ConfigDict, EmailStr, Field
 
 from app.models.order import OrderStatus, PaymentStatus
 
-# -------------------------------
-# Request side (one-shot checkout)
-# -------------------------------
 
 class DeliveryAddress(BaseModel):
-    """Delivery details submitted at checkout."""
-
     recipient_name: str | None = Field(default=None, max_length=255)
     phone: str | None = Field(default=None, max_length=50)
     address_line1: str = Field(min_length=1, max_length=255)
@@ -27,36 +22,16 @@ class DeliveryAddress(BaseModel):
 
 
 class CheckoutItem(BaseModel):
-    """A single cart line sent by the frontend.
-
-    IMPORTANT: No price is accepted here. The server always queries the DB for
-    the authoritative `unit_price` — frontend-supplied prices are never trusted.
-    """
-
     product_id: uuid.UUID
     quantity: int = Field(gt=0, le=1000)
 
 
 class CheckoutRequest(BaseModel):
-    """The single payload the frontend posts to the checkout endpoint.
-
-    `guest_email` is optional when a logged-in buyer checks out — the server
-    derives the order email from the authenticated account then. It is required
-    for guest checkout.
-
-    `delivery` is optional when a logged-in buyer chooses to use their saved
-    address (`use_saved_address=True`). Guests must always supply `delivery`.
-    """
-
     guest_email: EmailStr | None = None
     delivery: DeliveryAddress | None = None
     use_saved_address: bool = False
     items: list[CheckoutItem] = Field(min_length=1)
 
-
-# -------------------------------
-# Response side
-# -------------------------------
 
 class OrderItemRead(BaseModel):
     model_config = ConfigDict(from_attributes=True)
@@ -69,13 +44,11 @@ class OrderItemRead(BaseModel):
 
 
 class OrderRead(BaseModel):
-    """Full order representation returned to the client."""
-
     model_config = ConfigDict(from_attributes=True)
 
     id: uuid.UUID
     guest_email: EmailStr
-    delivery: DeliveryAddress | None = None  # flattened in service mapper
+    delivery: DeliveryAddress | None = None
     total_amount: Decimal
     status: OrderStatus
     payment_status: PaymentStatus
@@ -85,22 +58,16 @@ class OrderRead(BaseModel):
     items: list[OrderItemRead] = []
 
 
+# Export alias so legacy imports do not break
+OrderResponse = OrderRead
+
+
 class CheckoutResponse(BaseModel):
-    """Returned by the checkout endpoint.
-
-    Carries the persisted order plus the Paystack payment details the frontend
-    needs to redirect the guest (`authorization_url`) and, optionally, to open
-    the modal (`access_code`).
-    """
-
     order: OrderRead
     authorization_url: str
     access_code: str | None = None
-    # The reference the frontend can pass back / listen for in webhook events.
     reference: str
 
 
 class OrderStatusUpdate(BaseModel):
-    """Used by internal/admin tools (not the customer-facing checkout)."""
-
     status: OrderStatus

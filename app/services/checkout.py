@@ -167,7 +167,26 @@ class CheckoutService:
         safe under concurrency: only one of two simultaneous checkouts for the
         last unit can succeed (rowcount == 1). If a row is *not* affected, the
         stock ran out and we abort the whole checkout. The caller then never
-        persists the order (the transaction rolls back).
+        persists the order (the transaction rolls back).False)
+    status: Mapped[OrderStatus] = mapped_column(
+        Enum(OrderStatus, name="order_status"),
+        default=OrderStatus.PENDING,
+        nullable=False,
+        index=True,
+    )
+    payment_status: Mapped[PaymentStatus] = mapped_column(
+        Enum(PaymentStatus, name="payment_status"),
+        default=PaymentStatus.UNPAID,
+        nullable=False,
+    )
+
+    order_source: Mapped[str] = mapped_column(
+        String(20),
+        default="ONLINE",
+        nullable=False,
+        server_default="ONLINE",
+    )
+
         """
         for item in items:
             product = products_by_id[item.product_id]
