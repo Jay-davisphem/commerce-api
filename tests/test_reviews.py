@@ -13,13 +13,11 @@ async def test_product_rating_defaults_to_max(client, auth_headers, create_user)
     seller = await create_user("seller-rate@test.com", "sellerpass", UserRole.SELLER)
     headers = await auth_headers("seller-rate@test.com", "sellerpass")
 
-    # Create new product with no reviews
     prod = {"title": "Omega 3 Ultra", "price": "6000.00"}
     res = await client.post("/api/v1/products", json=prod, headers=headers)
     assert res.status_code == 201
     data = res.json()
 
-    # Must default to 5.0 rating with 0 reviews
     assert Decimal(str(data["rating"])) == Decimal("5.0")
     assert data["reviews_count"] == 0
 
@@ -31,6 +29,7 @@ async def test_submit_review_updates_product_average(client, auth_headers, creat
 
     prod = {"title": "Vitamin D3", "price": "4000.00"}
     prod_res = await client.post("/api/v1/products", json=prod, headers=headers)
+    assert prod_res.status_code == 201
     pid = prod_res.json()["id"]
 
     # First review: 4 stars
@@ -63,6 +62,7 @@ async def test_seller_reviews_list(client, auth_headers, create_user):
 
     prod = {"title": "CoQ10 Heart Support", "price": "12000.00"}
     prod_res = await client.post("/api/v1/products", json=prod, headers=headers)
+    assert prod_res.status_code == 201
     pid = prod_res.json()["id"]
 
     await client.post(
@@ -70,10 +70,10 @@ async def test_seller_reviews_list(client, auth_headers, create_user):
         json={"rating": 5, "comment": "Loved it", "reviewer_name": "Chidi"},
     )
 
-    # Seller checks their review tab
+    # Seller checks their review tab (CursorPage)
     rev_res = await client.get("/api/v1/sellers/reviews", headers=headers)
     assert rev_res.status_code == 200
     rev_data = rev_res.json()
-    assert rev_data["total"] == 1
+    assert len(rev_data["items"]) == 1
     assert rev_data["items"][0]["reviewer_name"] == "Chidi"
     assert rev_data["items"][0]["product_title"] == "CoQ10 Heart Support"

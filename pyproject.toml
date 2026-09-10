@@ -19,6 +19,10 @@ dependencies = [
     # Auth: JWT tokens + bcrypt password hashing
     "PyJWT>=2.8",
     "bcrypt>=4.0",
+    "redis>=5.0",
+    # Media upload streaming and Cloudflare R2 client
+    "python-multipart>=0.0.9",
+    "aioboto3>=13.0",
 ]
 
 [project.optional-dependencies]

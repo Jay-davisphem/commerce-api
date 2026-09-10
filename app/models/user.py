@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import enum
-from sqlalchemy import Enum, String, Text
+
+from sqlalchemy import Enum, Index, String, Text
 from sqlalchemy.orm import Mapped, mapped_column, relationship
+
 from app.models.base import Base, TimestampMixin, UUIDPrimaryKeyMixin
 
 
@@ -18,6 +20,9 @@ class User(Base, UUIDPrimaryKeyMixin, TimestampMixin):
     """A platform user (buyer, seller, or super admin)."""
 
     __tablename__ = "users"
+    __table_args__ = (
+        Index("ix_users_created_id_desc", "created_at", "id"),
+    )
 
     email: Mapped[str] = mapped_column(String(255), unique=True, index=True, nullable=False)
     hashed_password: Mapped[str] = mapped_column(String(255), nullable=False)

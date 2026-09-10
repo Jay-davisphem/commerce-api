@@ -7,7 +7,8 @@ Paystack POSTs events (e.g. `charge.success`) to our endpoint. We:
 
 from __future__ import annotations
 
-from fastapi import Header, HTTPException, Request, status
+from datetime import datetime, timezone
+from fastapi import HTTPException, Request, status
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -23,7 +24,6 @@ class PaystackWebhookHandler:
     async def handle(self, request: Request) -> dict:
         payload_bytes = await request.body()
         signature = request.headers.get("x-paystack-signature", "")
-
         if not paystack.verify_webhook_signature(payload_bytes, signature):
             raise HTTPException(
                 status_code=status.HTTP_401_UNAUTHORIZED,
@@ -31,11 +31,10 @@ class PaystackWebhookHandler:
             )
 
         event = PaystackWebhook.model_validate_json(payload_bytes)
-
         if event.event == "charge.success":
             await self._mark_paid(event)
 
-        # Paystack expects a 200 with an empty body on success.
+        # Paystack expects a 200 with an empty or status JSON body on success
         return {"status": "ok"}
 
     async def _mark_paid(self, event: PaystackWebhook) -> None:
@@ -50,6 +49,17 @@ class PaystackWebhookHandler:
 
         order.status = OrderStatus.PAID
         order.payment_status = PaymentStatus.PAID
-        if event.data.paid_at:
-            order.paid_at = event.data.paid_at
+
+        # Safely convert ISO string or datetime into a timezone-aware datetime instance for asyncpg
+        raw_paid_at = event.data.paid_at
+        if isinstance(raw_paid_at, str):
+            try:
+                order.paid_at = datetime.fromisoformat(raw_paid_at.replace("Z", "+00:00"))
+            except ValueError:
+                order.paid_at = datetime.now(timezone.utc)
+        elif isinstance(raw_paid_at, datetime):
+            order.paid_at = raw_paid_at
+        else:
+            order.paid_at = datetime.now(timezone.utc)
+
         await self.db.commit()

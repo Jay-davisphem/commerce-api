@@ -1,18 +1,17 @@
 from __future__ import annotations
 
-import math
 import uuid
 from datetime import datetime, time
 from decimal import Decimal
 from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
-from sqlalchemy import func, or_, select
+from sqlalchemy import and_, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.database import get_db
 from app.models import Order, OrderStatus, Product, Review, User, UserRole
-from app.schemas.pagination import PaginatedResponse
+from app.schemas.pagination import CursorPage, decode_cursor, encode_cursor
 from app.schemas.product import ProductRead
 from app.schemas.review import ReviewRead
 from app.schemas.seller import (
@@ -28,40 +27,87 @@ router = APIRouter(prefix="/sellers", tags=["Sellers"])
 
 
 # ==========================================
-# 1. SELLER INVENTORY (READ-ONLY SCOPED)
+# 1. SELLER INVENTORY (BIDIRECTIONAL CURSOR)
 # ==========================================
 
-@router.get("/products", response_model=PaginatedResponse[ProductRead])
+@router.get("/products", response_model=CursorPage[ProductRead])
 async def list_my_products(
     db: AsyncSession = Depends(get_db),
     seller: User = Depends(require_seller),
     q: Optional[str] = Query(None, description="Search own products by title"),
-    page: int = Query(1, ge=1),
-    page_size: int = Query(10, ge=1, le=100),
-) -> PaginatedResponse[ProductRead]:
-    """List products owned exclusively by the authenticated seller."""
+    after: Optional[str] = Query(None, description="Fetch products after this cursor (Next page)"),
+    before: Optional[str] = Query(None, description="Fetch products before this cursor (Previous page)"),
+    limit: int = Query(10, ge=1, le=100),
+) -> CursorPage[ProductRead]:
+    """List products owned exclusively by the seller with bidirectional cursor pagination."""
+    if after and before:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Cannot provide both 'after' and 'before' cursors simultaneously",
+        )
+
     query = select(Product).where(Product.owner_id == seller.id)
 
     if q:
         query = query.where(Product.title.ilike(f"%{q}%"))
 
-    count_query = select(func.count()).select_from(query.subquery())
-    total = (await db.execute(count_query)).scalar_one() or 0
+    is_backward = before is not None
 
-    paginated_query = (
-        query.order_by(Product.created_at.desc())
-        .offset((page - 1) * page_size)
-        .limit(page_size)
-    )
-    result = await db.execute(paginated_query)
-    items = list(result.scalars().all())
+    if after:
+        try:
+            val_str, cursor_id = decode_cursor(after)
+            cursor_dt = datetime.fromisoformat(val_str)
+            query = query.where(
+                or_(
+                    Product.created_at < cursor_dt,
+                    and_(Product.created_at == cursor_dt, Product.id < cursor_id),
+                )
+            )
+        except Exception:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid pagination cursor")
+    elif before:
+        try:
+            val_str, cursor_id = decode_cursor(before)
+            cursor_dt = datetime.fromisoformat(val_str)
+            query = query.where(
+                or_(
+                    Product.created_at > cursor_dt,
+                    and_(Product.created_at == cursor_dt, Product.id > cursor_id),
+                )
+            )
+        except Exception:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid pagination cursor")
 
-    return PaginatedResponse(
+    # Invert sorting on backward navigation
+    if is_backward:
+        query = query.order_by(Product.created_at.asc(), Product.id.asc())
+    else:
+        query = query.order_by(Product.created_at.desc(), Product.id.desc())
+
+    result = await db.execute(query.limit(limit + 1))
+    rows = list(result.scalars().all())
+
+    has_more = len(rows) > limit
+    items = rows[:limit]
+
+    if is_backward:
+        items.reverse()
+        has_next = True
+        has_prev = has_more
+    else:
+        has_next = has_more
+        has_prev = after is not None
+
+    next_cursor = encode_cursor(items[-1].created_at, items[-1].id) if (has_next and items) else None
+    prev_cursor = encode_cursor(items[0].created_at, items[0].id) if (has_prev and items) else None
+
+    return CursorPage(
         items=items,
-        total=total,
-        page=page,
-        page_size=page_size,
-        total_pages=math.ceil(total / page_size) if total > 0 else 1,
+        next_cursor=next_cursor,
+        prev_cursor=prev_cursor,
+        has_next=has_next,
+        has_prev=has_prev,
+        limit=limit,
     )
 
 
@@ -74,7 +120,6 @@ async def get_seller_dashboard(
     db: AsyncSession = Depends(get_db),
     seller: User = Depends(require_seller),
 ) -> SellerDashboardStats:
-    """Fetch dashboard KPI metrics, low-stock items, and recent orders."""
     today_start = datetime.combine(datetime.utcnow().date(), time.min)
 
     online_stmt = select(func.count(Order.id)).where(
@@ -150,32 +195,74 @@ async def get_seller_dashboard(
 
 
 # ==========================================
-# 3. SELLER REVIEWS (DASHBOARD TAB)
+# 3. SELLER REVIEWS (BIDIRECTIONAL CURSOR)
 # ==========================================
 
-@router.get("/reviews", response_model=PaginatedResponse[ReviewRead])
+@router.get("/reviews", response_model=CursorPage[ReviewRead])
 async def list_seller_reviews(
     db: AsyncSession = Depends(get_db),
     seller: User = Depends(require_seller),
-    page: int = Query(1, ge=1),
-    page_size: int = Query(10, ge=1, le=50),
-) -> PaginatedResponse[ReviewRead]:
-    """Fetch customer reviews for all products owned by the authenticated seller."""
+    after: Optional[str] = Query(None, description="Fetch reviews after this cursor (Next page)"),
+    before: Optional[str] = Query(None, description="Fetch reviews before this cursor (Previous page)"),
+    limit: int = Query(10, ge=1, le=50),
+) -> CursorPage[ReviewRead]:
+    """Fetch reviews for products owned by this seller with bidirectional cursor pagination."""
+    if after and before:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Cannot provide both 'after' and 'before' cursors simultaneously",
+        )
+
     query = (
         select(Review, Product.title)
         .join(Product, Review.product_id == Product.id)
         .where(Product.owner_id == seller.id)
     )
 
-    count_stmt = select(func.count()).select_from(query.subquery())
-    total = (await db.execute(count_stmt)).scalar_one() or 0
+    is_backward = before is not None
 
-    paginated_stmt = (
-        query.order_by(Review.created_at.desc())
-        .offset((page - 1) * page_size)
-        .limit(page_size)
-    )
-    results = (await db.execute(paginated_stmt)).all()
+    if after:
+        try:
+            val_str, cursor_id = decode_cursor(after)
+            cursor_dt = datetime.fromisoformat(val_str)
+            query = query.where(
+                or_(
+                    Review.created_at < cursor_dt,
+                    and_(Review.created_at == cursor_dt, Review.id < cursor_id),
+                )
+            )
+        except Exception:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid pagination cursor")
+    elif before:
+        try:
+            val_str, cursor_id = decode_cursor(before)
+            cursor_dt = datetime.fromisoformat(val_str)
+            query = query.where(
+                or_(
+                    Review.created_at > cursor_dt,
+                    and_(Review.created_at == cursor_dt, Review.id > cursor_id),
+                )
+            )
+        except Exception:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid pagination cursor")
+
+    if is_backward:
+        query = query.order_by(Review.created_at.asc(), Review.id.asc())
+    else:
+        query = query.order_by(Review.created_at.desc(), Review.id.desc())
+
+    results = list((await db.execute(query.limit(limit + 1))).all())
+
+    has_more = len(results) > limit
+    page_results = results[:limit]
+
+    if is_backward:
+        page_results.reverse()
+        has_next = True
+        has_prev = has_more
+    else:
+        has_next = has_more
+        has_prev = after is not None
 
     items = [
         ReviewRead(
@@ -188,32 +275,43 @@ async def list_seller_reviews(
             created_at=review.created_at,
             product_title=product_title,
         )
-        for review, product_title in results
+        for review, product_title in page_results
     ]
 
-    return PaginatedResponse(
+    next_cursor = encode_cursor(page_results[-1][0].created_at, page_results[-1][0].id) if (has_next and page_results) else None
+    prev_cursor = encode_cursor(page_results[0][0].created_at, page_results[0][0].id) if (has_prev and page_results) else None
+
+    return CursorPage(
         items=items,
-        total=total,
-        page=page,
-        page_size=page_size,
-        total_pages=math.ceil(total / page_size) if total > 0 else 1,
+        next_cursor=next_cursor,
+        prev_cursor=prev_cursor,
+        has_next=has_next,
+        has_prev=has_prev,
+        limit=limit,
     )
 
 
 # ==========================================
-# 4. SELLER ORDER FULFILLMENT & RESTOCK
+# 4. SELLER ORDERS (BIDIRECTIONAL CURSOR)
 # ==========================================
 
-@router.get("/orders", response_model=PaginatedResponse[RecentOrderSummary])
+@router.get("/orders", response_model=CursorPage[RecentOrderSummary])
 async def list_seller_orders(
     db: AsyncSession = Depends(get_db),
     seller: User = Depends(require_seller),
     status_filter: Optional[str] = Query(None, alias="status"),
     search: Optional[str] = Query(None),
-    page: int = Query(1, ge=1),
-    page_size: int = Query(10, ge=1, le=50),
-) -> PaginatedResponse[RecentOrderSummary]:
-    """Search and filter customer orders with pagination."""
+    after: Optional[str] = Query(None, description="Fetch orders after this cursor (Next page)"),
+    before: Optional[str] = Query(None, description="Fetch orders before this cursor (Previous page)"),
+    limit: int = Query(10, ge=1, le=50),
+) -> CursorPage[RecentOrderSummary]:
+    """Search and filter customer orders with bidirectional cursor pagination."""
+    if after and before:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Cannot provide both 'after' and 'before' cursors simultaneously",
+        )
+
     query = select(Order)
 
     if status_filter:
@@ -228,15 +326,50 @@ async def list_seller_orders(
             )
         )
 
-    count_stmt = select(func.count()).select_from(query.subquery())
-    total = (await db.execute(count_stmt)).scalar_one() or 0
+    is_backward = before is not None
 
-    paginated_stmt = (
-        query.order_by(Order.created_at.desc())
-        .offset((page - 1) * page_size)
-        .limit(page_size)
-    )
-    orders = (await db.execute(paginated_stmt)).scalars().all()
+    if after:
+        try:
+            val_str, cursor_id = decode_cursor(after)
+            cursor_dt = datetime.fromisoformat(val_str)
+            query = query.where(
+                or_(
+                    Order.created_at < cursor_dt,
+                    and_(Order.created_at == cursor_dt, Order.id < cursor_id),
+                )
+            )
+        except Exception:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid pagination cursor")
+    elif before:
+        try:
+            val_str, cursor_id = decode_cursor(before)
+            cursor_dt = datetime.fromisoformat(val_str)
+            query = query.where(
+                or_(
+                    Order.created_at > cursor_dt,
+                    and_(Order.created_at == cursor_dt, Order.id > cursor_id),
+                )
+            )
+        except Exception:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid pagination cursor")
+
+    if is_backward:
+        query = query.order_by(Order.created_at.asc(), Order.id.asc())
+    else:
+        query = query.order_by(Order.created_at.desc(), Order.id.desc())
+
+    orders = list((await db.execute(query.limit(limit + 1))).scalars().all())
+
+    has_more = len(orders) > limit
+    page_orders = orders[:limit]
+
+    if is_backward:
+        page_orders.reverse()
+        has_next = True
+        has_prev = has_more
+    else:
+        has_next = has_more
+        has_prev = after is not None
 
     items = [
         RecentOrderSummary(
@@ -247,15 +380,19 @@ async def list_seller_orders(
             status=o.status.value.replace("_", " ").title(),
             created_at=o.created_at,
         )
-        for o in orders
+        for o in page_orders
     ]
 
-    return PaginatedResponse(
+    next_cursor = encode_cursor(page_orders[-1].created_at, page_orders[-1].id) if (has_next and page_orders) else None
+    prev_cursor = encode_cursor(page_orders[0].created_at, page_orders[0].id) if (has_prev and page_orders) else None
+
+    return CursorPage(
         items=items,
-        total=total,
-        page=page,
-        page_size=page_size,
-        total_pages=math.ceil(total / page_size) if total > 0 else 1,
+        next_cursor=next_cursor,
+        prev_cursor=prev_cursor,
+        has_next=has_next,
+        has_prev=has_prev,
+        limit=limit,
     )
 
 
@@ -266,7 +403,6 @@ async def update_order_status(
     db: AsyncSession = Depends(get_db),
     seller: User = Depends(require_seller),
 ) -> dict[str, str]:
-    """Update order delivery status (in_transit, delivered, cancelled)."""
     order = await db.get(Order, order_id)
     if order is None:
         raise HTTPException(
@@ -294,7 +430,6 @@ async def restock_product(
     db: AsyncSession = Depends(get_db),
     seller: User = Depends(require_seller),
 ) -> dict[str, object]:
-    """Increment inventory count for an alert item."""
     product = await db.get(Product, product_id)
     if product is None:
         raise HTTPException(

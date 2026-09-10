@@ -21,8 +21,6 @@ from app.models.base import Base, TimestampMixin
 
 
 class OrderStatus(str, enum.Enum):
-    """Lifecycle of an order in the checkout & delivery flow."""
-
     PENDING = "pending"
     PAID = "paid"
     IN_ESCROW = "in_escrow"
@@ -33,8 +31,6 @@ class OrderStatus(str, enum.Enum):
 
 
 class PaymentStatus(str, enum.Enum):
-    """Payment tracking separate from delivery status."""
-
     UNPAID = "unpaid"
     PAID = "paid"
     FAILED = "failed"
@@ -45,11 +41,11 @@ class Order(Base, TimestampMixin):
 
     __tablename__ = "orders"
     __table_args__ = (
-        CheckConstraint(
-            "total_amount >= 0",
-            name="ck_orders_total_non_negative",
-        ),
+        CheckConstraint("total_amount >= 0", name="ck_orders_total_non_negative"),
         Index("ix_orders_paystack_reference", "paystack_reference"),
+        Index("ix_orders_created_id_desc", "created_at", "id"),
+        Index("ix_orders_user_created", "user_id", "created_at"),
+        Index("ix_orders_status_created", "status", "created_at"),
     )
 
     id: Mapped[uuid.UUID] = mapped_column(primary_key=True, default=uuid.uuid4)

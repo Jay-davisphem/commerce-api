@@ -1,52 +1,55 @@
 from __future__ import annotations
 
-import math
 import uuid
+from datetime import datetime
 from decimal import Decimal
-from typing import Optional
+from typing import Any, Optional
 
-from fastapi import APIRouter, Depends, HTTPException, Query, status
-from sqlalchemy import func, or_, select
+from fastapi import APIRouter, Depends, File, HTTPException, Query, UploadFile, status
+from sqlalchemy import and_, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.cache import cache_service
+from app.core.config import settings
 from app.core.database import get_db
 from app.models import Product, Review, User, UserRole
-from app.schemas.pagination import PaginatedResponse
+from app.schemas.pagination import CursorPage, decode_cursor, encode_cursor
 from app.schemas.product import CategoryRead, ProductCreate, ProductRead, ProductUpdate
 from app.schemas.review import ReviewCreate, ReviewRead
 from app.services.auth import get_current_optional_user, require_seller
+from app.services.storage import storage_service
 
 router = APIRouter(prefix="/products", tags=["Products"])
 
 
-# --- Public Storefront Endpoints ---
+# --- Public Storefront Catalog ---
 
-@router.get("", response_model=PaginatedResponse[ProductRead])
+@router.get("", response_model=CursorPage[ProductRead])
 async def list_products(
     db: AsyncSession = Depends(get_db),
-    q: Optional[str] = Query(None, description="Search product name/title or description"),
-    category: Optional[str] = Query(None, description="Filter by category slug or name"),
+    q: Optional[str] = Query(None, description="Search product title/description (GIN Trigram indexed)"),
+    category: Optional[str] = Query(None, description="Filter by category"),
     tag: Optional[str] = Query(None, description="hot_deal, special_offer, recommended"),
     min_price: Optional[Decimal] = Query(None, ge=0),
     max_price: Optional[Decimal] = Query(None, ge=0),
     sort_by: str = Query(
         "newest",
-        pattern="^(newest|latest|created_at_desc|oldest|created_at_asc|price_asc|price_desc)$",
-        description="Sort option. 'newest' uses creation timestamp for pure date sorting.",
+        pattern="^(newest|latest|oldest|price_asc|price_desc)$",
     ),
-    page: int = Query(1, ge=1),
-    page_size: int = Query(12, ge=1, le=100),
-) -> PaginatedResponse[ProductRead]:
-    """Public storefront catalog search and pagination."""
+    after: Optional[str] = Query(None, description="Fetch items after this cursor (Next page)"),
+    before: Optional[str] = Query(None, description="Fetch items before this cursor (Previous page)"),
+    limit: int = Query(12, ge=1, le=100),
+) -> CursorPage[ProductRead]:
+    if after and before:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Cannot provide both 'after' and 'before' cursors simultaneously",
+        )
+
     query = select(Product)
 
     if q:
-        query = query.where(
-            or_(
-                Product.title.ilike(f"%{q}%"),
-                Product.description.ilike(f"%{q}%"),
-            )
-        )
+        query = query.where(or_(Product.title.ilike(f"%{q}%"), Product.description.ilike(f"%{q}%")))
     if category:
         query = query.where(Product.category.ilike(category))
     if tag:
@@ -56,89 +59,192 @@ async def list_products(
     if max_price is not None:
         query = query.where(Product.price <= max_price)
 
-    # Sorting
+    # 1. Forward seek
+    if after:
+        val_str, cursor_id = decode_cursor(after)
+        if sort_by in ("newest", "latest"):
+            cursor_dt = datetime.fromisoformat(val_str)
+            query = query.where(
+                or_(Product.created_at < cursor_dt, and_(Product.created_at == cursor_dt, Product.id < cursor_id))
+            )
+        elif sort_by == "oldest":
+            cursor_dt = datetime.fromisoformat(val_str)
+            query = query.where(
+                or_(Product.created_at > cursor_dt, and_(Product.created_at == cursor_dt, Product.id > cursor_id))
+            )
+        elif sort_by == "price_asc":
+            cursor_price = Decimal(val_str)
+            query = query.where(
+                or_(Product.price > cursor_price, and_(Product.price == cursor_price, Product.id > cursor_id))
+            )
+        elif sort_by == "price_desc":
+            cursor_price = Decimal(val_str)
+            query = query.where(
+                or_(Product.price < cursor_price, and_(Product.price == cursor_price, Product.id < cursor_id))
+            )
+
+    # 2. Backward seek
+    elif before:
+        val_str, cursor_id = decode_cursor(before)
+        if sort_by in ("newest", "latest"):
+            cursor_dt = datetime.fromisoformat(val_str)
+            query = query.where(
+                or_(Product.created_at > cursor_dt, and_(Product.created_at == cursor_dt, Product.id > cursor_id))
+            )
+        elif sort_by == "oldest":
+            cursor_dt = datetime.fromisoformat(val_str)
+            query = query.where(
+                or_(Product.created_at < cursor_dt, and_(Product.created_at == cursor_dt, Product.id < cursor_id))
+            )
+        elif sort_by == "price_asc":
+            cursor_price = Decimal(val_str)
+            query = query.where(
+                or_(Product.price < cursor_price, and_(Product.price == cursor_price, Product.id < cursor_id))
+            )
+        elif sort_by == "price_desc":
+            cursor_price = Decimal(val_str)
+            query = query.where(
+                or_(Product.price > cursor_price, and_(Product.price == cursor_price, Product.id > cursor_id))
+            )
+
+    is_backward = before is not None
     if sort_by == "price_asc":
-        query = query.order_by(Product.price.asc())
+        query = query.order_by(
+            Product.price.desc() if is_backward else Product.price.asc(),
+            Product.id.desc() if is_backward else Product.id.asc(),
+        )
     elif sort_by == "price_desc":
-        query = query.order_by(Product.price.desc())
-    elif sort_by in ("oldest", "created_at_asc"):
-        query = query.order_by(Product.created_at.asc())
+        query = query.order_by(
+            Product.price.asc() if is_backward else Product.price.desc(),
+            Product.id.asc() if is_backward else Product.id.desc(),
+        )
+    elif sort_by == "oldest":
+        query = query.order_by(
+            Product.created_at.desc() if is_backward else Product.created_at.asc(),
+            Product.id.desc() if is_backward else Product.id.asc(),
+        )
     else:
-        # Default: newest (pure date sorting: new to old)
-        query = query.order_by(Product.created_at.desc())
+        query = query.order_by(
+            Product.created_at.asc() if is_backward else Product.created_at.desc(),
+            Product.id.asc() if is_backward else Product.id.desc(),
+        )
 
-    count_stmt = select(func.count()).select_from(query.subquery())
-    total = (await db.execute(count_stmt)).scalar_one() or 0
+    result = await db.execute(query.limit(limit + 1))
+    rows = list(result.scalars().all())
 
-    paginated_stmt = query.offset((page - 1) * page_size).limit(page_size)
-    result = await db.execute(paginated_stmt)
-    items = list(result.scalars().all())
+    has_more = len(rows) > limit
+    items = rows[:limit]
 
-    return PaginatedResponse(
+    if is_backward:
+        items.reverse()
+        has_next = True
+        has_prev = has_more
+    else:
+        has_next = has_more
+        has_prev = after is not None
+
+    def get_sort_key(item: Product) -> Any:
+        return item.price if "price" in sort_by else item.created_at
+
+    next_cursor = encode_cursor(get_sort_key(items[-1]), items[-1].id) if (has_next and items) else None
+    prev_cursor = encode_cursor(get_sort_key(items[0]), items[0].id) if (has_prev and items) else None
+
+    return CursorPage(
         items=items,
-        total=total,
-        page=page,
-        page_size=page_size,
-        total_pages=math.ceil(total / page_size) if total > 0 else 1,
+        next_cursor=next_cursor,
+        prev_cursor=prev_cursor,
+        has_next=has_next,
+        has_prev=has_prev,
+        has_more=has_next,
+        limit=limit,
     )
 
 
 @router.get("/categories", response_model=list[CategoryRead])
-async def list_categories(
-    db: AsyncSession = Depends(get_db),
-) -> list[CategoryRead]:
-    """Active categories and counts for filter pills."""
+async def list_categories(db: AsyncSession = Depends(get_db)) -> list[CategoryRead]:
+    cache_key = "catalog:categories:v1"
+    cached = await cache_service.get(cache_key)
+    if cached:
+        return [CategoryRead(**c) for c in cached]
+
     stmt = (
         select(Product.category, func.count(Product.id))
         .where(Product.category.is_not(None))
         .group_by(Product.category)
     )
     result = await db.execute(stmt)
-    return [CategoryRead(name=cat, count=cnt) for cat, cnt in result.all() if cat]
+    cats = [CategoryRead(name=cat, count=cnt) for cat, cnt in result.all() if cat]
+    await cache_service.set(cache_key, [c.model_dump() for c in cats], ttl_seconds=300)
+    return cats
 
 
 @router.get("/{product_id}", response_model=ProductRead)
-async def get_product(
-    product_id: uuid.UUID,
-    db: AsyncSession = Depends(get_db),
-) -> Product:
-    """View a single product by UUID."""
+async def get_product(product_id: uuid.UUID, db: AsyncSession = Depends(get_db)) -> Product:
     product = await db.get(Product, product_id)
     if product is None:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Product not found",
-        )
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Product not found")
     return product
 
 
 # --- Product Reviews Endpoints ---
 
-@router.get("/{product_id}/reviews", response_model=PaginatedResponse[ReviewRead])
+@router.get("/{product_id}/reviews", response_model=CursorPage[ReviewRead])
 async def list_product_reviews(
     product_id: uuid.UUID,
     db: AsyncSession = Depends(get_db),
-    page: int = Query(1, ge=1),
-    page_size: int = Query(10, ge=1, le=50),
-) -> PaginatedResponse[ReviewRead]:
-    """Fetch reviews for a specific product."""
-    product = await db.get(Product, product_id)
-    if product is None:
+    after: Optional[str] = Query(None, description="Fetch reviews after this cursor (Next page)"),
+    before: Optional[str] = Query(None, description="Fetch reviews before this cursor (Previous page)"),
+    limit: int = Query(10, ge=1, le=50),
+) -> CursorPage[ReviewRead]:
+    if after and before:
         raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Product not found",
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Cannot provide both 'after' and 'before' cursors simultaneously",
         )
 
-    query = select(Review).where(Review.product_id == product_id)
-    count_stmt = select(func.count()).select_from(query.subquery())
-    total = (await db.execute(count_stmt)).scalar_one() or 0
+    product = await db.get(Product, product_id)
+    if product is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Product not found")
 
-    paginated_stmt = (
-        query.order_by(Review.created_at.desc())
-        .offset((page - 1) * page_size)
-        .limit(page_size)
-    )
-    reviews = (await db.execute(paginated_stmt)).scalars().all()
+    query = select(Review).where(Review.product_id == product_id)
+    is_backward = before is not None
+
+    if after:
+        try:
+            val_str, cursor_id = decode_cursor(after)
+            cursor_dt = datetime.fromisoformat(val_str)
+            query = query.where(
+                or_(Review.created_at < cursor_dt, and_(Review.created_at == cursor_dt, Review.id < cursor_id))
+            )
+        except Exception:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid pagination cursor")
+    elif before:
+        try:
+            val_str, cursor_id = decode_cursor(before)
+            cursor_dt = datetime.fromisoformat(val_str)
+            query = query.where(
+                or_(Review.created_at > cursor_dt, and_(Review.created_at == cursor_dt, Review.id > cursor_id))
+            )
+        except Exception:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid pagination cursor")
+
+    if is_backward:
+        query = query.order_by(Review.created_at.asc(), Review.id.asc())
+    else:
+        query = query.order_by(Review.created_at.desc(), Review.id.desc())
+
+    reviews = list((await db.execute(query.limit(limit + 1))).scalars().all())
+
+    has_more = len(reviews) > limit
+    page_reviews = reviews[:limit]
+
+    if is_backward:
+        page_reviews.reverse()
+        has_next = True
+        has_prev = has_more
+    else:
+        has_next = has_more
+        has_prev = after is not None
 
     items = [
         ReviewRead(
@@ -151,15 +257,20 @@ async def list_product_reviews(
             created_at=r.created_at,
             product_title=product.title,
         )
-        for r in reviews
+        for r in page_reviews
     ]
 
-    return PaginatedResponse(
+    next_cursor = encode_cursor(page_reviews[-1].created_at, page_reviews[-1].id) if (has_next and page_reviews) else None
+    prev_cursor = encode_cursor(page_reviews[0].created_at, page_reviews[0].id) if (has_prev and page_reviews) else None
+
+    return CursorPage(
         items=items,
-        total=total,
-        page=page,
-        page_size=page_size,
-        total_pages=math.ceil(total / page_size) if total > 0 else 1,
+        next_cursor=next_cursor,
+        prev_cursor=prev_cursor,
+        has_next=has_next,
+        has_prev=has_prev,
+        has_more=has_next,
+        limit=limit,
     )
 
 
@@ -170,13 +281,9 @@ async def create_product_review(
     db: AsyncSession = Depends(get_db),
     current_user: User | None = Depends(get_current_optional_user),
 ) -> ReviewRead:
-    """Submit a rating (1-5) and feedback for a product. Automatically recalculates product average."""
     product = await db.get(Product, product_id)
     if product is None:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Product not found",
-        )
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Product not found")
 
     reviewer_name = payload.reviewer_name
     if current_user:
@@ -194,7 +301,6 @@ async def create_product_review(
     db.add(review)
     await db.flush()
 
-    # Re-aggregate authoritative average rating and review count
     stmt = select(
         func.coalesce(func.round(func.avg(Review.rating), 1), Decimal("5.0")),
         func.count(Review.id),
@@ -219,19 +325,14 @@ async def create_product_review(
     )
 
 
-# --- Product Management Mutations ---
+# --- Product Creation, Update, Deletion & Cloudflare R2 Upload ---
 
-@router.post(
-    "",
-    response_model=ProductRead,
-    status_code=status.HTTP_201_CREATED,
-)
+@router.post("", response_model=ProductRead, status_code=status.HTTP_201_CREATED)
 async def create_product(
     payload: ProductCreate,
     db: AsyncSession = Depends(get_db),
     seller: User = Depends(require_seller),
 ) -> Product:
-    """Create a product owned by the authenticated seller."""
     data = payload.model_dump(exclude_unset=True)
     if "name" in data and "title" not in data:
         data["title"] = data.pop("name")
@@ -241,6 +342,67 @@ async def create_product(
     data["owner_id"] = seller.id
     product = Product(**data)
     db.add(product)
+    await db.commit()
+    await db.refresh(product)
+    await cache_service.invalidate_prefix("catalog:categories")
+    return product
+
+
+@router.post("/{product_id}/image", response_model=ProductRead)
+async def upload_product_image(
+    product_id: uuid.UUID,
+    file: UploadFile = File(...),
+    db: AsyncSession = Depends(get_db),
+    seller: User = Depends(require_seller),
+) -> Product:
+    """Stream file into memory (max 5 MB), upload to Cloudflare R2, and update image_url."""
+    product = await db.get(Product, product_id)
+    if product is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Product not found")
+
+    if seller.role != UserRole.SUPER_ADMIN and (
+        product.owner_id is None or product.owner_id != seller.id
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="You can only upload images for your own products",
+        )
+
+    content_type = (file.content_type or "").lower()
+    if content_type not in settings.ALLOWED_IMAGE_TYPES:
+        raise HTTPException(
+            status_code=status.HTTP_415_UNSUPPORTED_MEDIA_TYPE,
+            detail=f"Unsupported file type. Allowed: {', '.join(settings.ALLOWED_IMAGE_TYPES)}",
+        )
+
+    ext_map = {
+        "image/jpeg": ".jpg",
+        "image/png": ".png",
+        "image/webp": ".webp",
+        "image/avif": ".avif",
+    }
+    ext = ext_map.get(content_type, ".jpg")
+    filename = f"products/{product_id}_{uuid.uuid4().hex[:8]}{ext}"
+
+    # Read and enforce max size
+    file_bytes = bytearray()
+    chunk_size = 1024 * 1024  # 1 MB chunks
+    while chunk := await file.read(chunk_size):
+        file_bytes.extend(chunk)
+        if len(file_bytes) > settings.MAX_IMAGE_SIZE_BYTES:
+            raise HTTPException(
+                status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+                detail=f"File exceeds maximum allowed size of {settings.MAX_IMAGE_SIZE_BYTES // (1024 * 1024)} MB",
+            )
+
+    # Clean up previous R2 asset if one was set
+    if product.image_url:
+        await storage_service.delete_file(product.image_url)
+
+    # Upload to Cloudflare R2
+    public_url = await storage_service.upload_file(bytes(file_bytes), filename, content_type)
+    product.image_url = public_url
+
     await db.commit()
     await db.refresh(product)
     return product
@@ -253,21 +415,14 @@ async def update_product(
     db: AsyncSession = Depends(get_db),
     seller: User = Depends(require_seller),
 ) -> Product:
-    """Update a product (owner or superadmin only)."""
     product = await db.get(Product, product_id)
     if product is None:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Product not found",
-        )
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Product not found")
 
     if seller.role != UserRole.SUPER_ADMIN and (
         product.owner_id is None or product.owner_id != seller.id
     ):
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="You can only manage your own products",
-        )
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="You can only manage your own products")
 
     for field, value in payload.model_dump(exclude_unset=True).items():
         if field == "name":
@@ -277,6 +432,7 @@ async def update_product(
 
     await db.commit()
     await db.refresh(product)
+    await cache_service.invalidate_prefix("catalog:categories")
     return product
 
 
@@ -286,21 +442,18 @@ async def delete_product(
     db: AsyncSession = Depends(get_db),
     seller: User = Depends(require_seller),
 ) -> None:
-    """Delete a product (owner or superadmin only)."""
     product = await db.get(Product, product_id)
     if product is None:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Product not found",
-        )
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Product not found")
 
     if seller.role != UserRole.SUPER_ADMIN and (
         product.owner_id is None or product.owner_id != seller.id
     ):
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="You can only manage your own products",
-        )
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="You can only manage your own products")
+
+    if product.image_url:
+        await storage_service.delete_file(product.image_url)
 
     await db.delete(product)
     await db.commit()
+    await cache_service.invalidate_prefix("catalog:categories")

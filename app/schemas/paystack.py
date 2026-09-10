@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-from typing import Any
-
+from datetime import datetime
+from typing import Any, Optional
 from pydantic import BaseModel, Field
 
 
@@ -13,11 +13,8 @@ class PaystackEventData(BaseModel):
     status: str | None = None
     amount: int | None = None  # in kobo (Paystack minor units)
     currency: str | None = None
-    paid_at: str | None = None
+    paid_at: Optional[datetime | str] = None
     customer: dict[str, Any] | None = None
-    # Paystack sends a fully typed account object; we keep it loosely typed here
-    # to be resilient to schema drift, but the fields we rely on (reference,
-    # status, amount) are validated explicitly.
     metadata: dict[str, Any] | None = None
 
 

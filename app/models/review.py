@@ -4,7 +4,7 @@ import uuid
 from datetime import datetime
 from typing import Optional
 
-from sqlalchemy import CheckConstraint, DateTime, ForeignKey, Integer, String, Text, func
+from sqlalchemy import CheckConstraint, DateTime, ForeignKey, Index, Integer, String, Text, func
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -17,6 +17,8 @@ class Review(Base, UUIDPrimaryKeyMixin, TimestampMixin):
     __tablename__ = "reviews"
     __table_args__ = (
         CheckConstraint("rating >= 1 AND rating <= 5", name="ck_reviews_rating_range"),
+        Index("ix_reviews_product_created", "product_id", "created_at"),
+        Index("ix_reviews_created_id_desc", "created_at", "id"),
     )
 
     product_id: Mapped[uuid.UUID] = mapped_column(

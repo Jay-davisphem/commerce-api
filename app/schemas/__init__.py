@@ -8,7 +8,7 @@ from app.schemas.order import (
     OrderResponse,
     OrderStatusUpdate,
 )
-from app.schemas.pagination import PaginatedResponse
+from app.schemas.pagination import CursorPage, decode_cursor, encode_cursor
 from app.schemas.paystack import PaystackEventData, PaystackWebhook, PaymentVerification
 from app.schemas.product import CategoryRead, ProductCreate, ProductRead, ProductUpdate
 from app.schemas.review import ReviewCreate, ReviewRead
@@ -37,7 +37,9 @@ __all__ = [
     "OrderResponse",
     "OrderStatusUpdate",
     "CheckoutResponse",
-    "PaginatedResponse",
+    "CursorPage",
+    "encode_cursor",
+    "decode_cursor",
     "PaystackEventData",
     "PaystackWebhook",
     "PaymentVerification",

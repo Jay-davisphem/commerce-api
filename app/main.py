@@ -8,14 +8,16 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from app.api.router import api_router
+from app.core.cache import cache_service
 from app.core.config import settings
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Schema is managed by Alembic migrations (alembic upgrade head) — see the
-    # migrations in alembic/versions/. Here we only ensure the super admin from
-    # .env exists (idempotent, skipped if env values are blank).
+    # Initialize cache backend (Redis or in-memory)
+    await cache_service.init_redis()
+
+    # Idempotently ensure the super admin from .env exists
     from app.core.database import AsyncSessionLocal
     from app.core.init_superadmin import ensure_superadmin
 
@@ -47,7 +49,11 @@ async def health() -> dict:
 
 
 def main() -> None:
-    """Run with: python -m app.main"""
+    """Run directly with: python -m app.main"""
     import uvicorn
 
     uvicorn.run("app.main:app", host="0.0.0.0", port=8000, reload=True)
+
+
+if __name__ == "__main__":
+    main()
