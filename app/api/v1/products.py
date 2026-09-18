@@ -13,8 +13,17 @@ from app.core.cache import cache_service
 from app.core.config import settings
 from app.core.database import get_db
 from app.models import Product, Review, User, UserRole
+from app.models.order_item import OrderItem
 from app.schemas.pagination import CursorPage, decode_cursor, encode_cursor
-from app.schemas.product import CategoryRead, ProductCreate, ProductRead, ProductUpdate
+from app.schemas.product import (
+    CategoryRead,
+    ProductCreate,
+    ProductRatingsSummary,
+    ProductRead,
+    ProductUpdate,
+    RatingCount,
+    StorefrontHomeResponse,
+)
 from app.schemas.review import ReviewCreate, ReviewRead
 from app.services.auth import get_current_optional_user, require_seller
 from app.services.storage import storage_service
@@ -22,7 +31,86 @@ from app.services.storage import storage_service
 router = APIRouter(prefix="/products", tags=["Products"])
 
 
-# --- Public Storefront Catalog ---
+# ==========================================
+# 1. STOREFRONT CATALOG & FEEDS
+# ==========================================
+
+@router.get("/storefront/home", response_model=StorefrontHomeResponse)
+async def get_storefront_homepage(db: AsyncSession = Depends(get_db)) -> StorefrontHomeResponse:
+    """Consolidated endpoint delivering all homepage shelves in a single cached call."""
+    cache_key = "storefront:homepage:v1"
+    cached = await cache_service.get(cache_key)
+    if cached:
+        return StorefrontHomeResponse(**cached)
+
+    # 1. Hot Deals
+    hot_deals = (await db.execute(
+        select(Product).where(Product.tag == "hot_deal").limit(5)
+    )).scalars().all()
+
+    # 2. Special Offers
+    special_offers = (await db.execute(
+        select(Product).where(Product.tag == "special_offer").limit(6)
+    )).scalars().all()
+
+    # 3. Recommended
+    recommended = (await db.execute(
+        select(Product).where(Product.tag == "recommended").limit(5)
+    )).scalars().all()
+
+    # 4. New Arrivals
+    new_arrivals = (await db.execute(
+        select(Product).order_by(Product.created_at.desc()).limit(5)
+    )).scalars().all()
+
+    # 5. Mostly Ordered
+    mostly_ordered_stmt = (
+        select(Product)
+        .outerjoin(OrderItem, Product.id == OrderItem.product_id)
+        .group_by(Product.id)
+        .order_by(func.coalesce(func.sum(OrderItem.quantity), 0).desc())
+        .limit(8)
+    )
+    mostly_ordered = (await db.execute(mostly_ordered_stmt)).scalars().all()
+
+    # 6. Categories
+    cat_stmt = (
+        select(Product.category, func.count(Product.id))
+        .where(Product.category.is_not(None))
+        .group_by(Product.category)
+    )
+    cats = [CategoryRead(name=c, count=cnt) for c, cnt in (await db.execute(cat_stmt)).all() if c]
+
+    response_data = {
+        "hot_deals": [ProductRead.model_validate(p).model_dump() for p in hot_deals],
+        "special_offers": [ProductRead.model_validate(p).model_dump() for p in special_offers],
+        "categories": [c.model_dump() for c in cats],
+        "recommended": [ProductRead.model_validate(p).model_dump() for p in recommended],
+        "new_arrivals": [ProductRead.model_validate(p).model_dump() for p in new_arrivals],
+        "mostly_ordered": [ProductRead.model_validate(p).model_dump() for p in mostly_ordered],
+    }
+
+    await cache_service.set(cache_key, response_data, ttl_seconds=300)
+    return StorefrontHomeResponse(**response_data)
+
+
+@router.get("/categories", response_model=list[CategoryRead])
+async def list_categories(db: AsyncSession = Depends(get_db)) -> list[CategoryRead]:
+    cache_key = "catalog:categories:v1"
+    cached = await cache_service.get(cache_key)
+    if cached:
+        return [CategoryRead(**c) for c in cached]
+
+    stmt = (
+        select(Product.category, func.count(Product.id))
+        .where(Product.category.is_not(None))
+        .group_by(Product.category)
+    )
+    result = await db.execute(stmt)
+    cats = [CategoryRead(name=cat, count=cnt) for cat, cnt in result.all() if cat]
+    await cache_service.set(cache_key, [c.model_dump() for c in cats], ttl_seconds=300)
+    return cats
+
 
 @router.get("", response_model=CursorPage[ProductRead])
 async def list_products(
@@ -59,7 +147,7 @@ async def list_products(
     if max_price is not None:
         query = query.where(Product.price <= max_price)
 
-    # 1. Forward seek
+    # Forward seek
     if after:
         val_str, cursor_id = decode_cursor(after)
         if sort_by in ("newest", "latest"):
@@ -83,7 +171,7 @@ async def list_products(
                 or_(Product.price < cursor_price, and_(Product.price == cursor_price, Product.id < cursor_id))
             )
 
-    # 2. Backward seek
+    # Backward seek
     elif before:
         val_str, cursor_id = decode_cursor(before)
         if sort_by in ("newest", "latest"):
@@ -160,23 +248,9 @@ async def list_products(
     )
 
 
-@router.get("/categories", response_model=list[CategoryRead])
-async def list_categories(db: AsyncSession = Depends(get_db)) -> list[CategoryRead]:
-    cache_key = "catalog:categories:v1"
-    cached = await cache_service.get(cache_key)
-    if cached:
-        return [CategoryRead(**c) for c in cached]
-
-    stmt = (
-        select(Product.category, func.count(Product.id))
-        .where(Product.category.is_not(None))
-        .group_by(Product.category)
-    )
-    result = await db.execute(stmt)
-    cats = [CategoryRead(name=cat, count=cnt) for cat, cnt in result.all() if cat]
-    await cache_service.set(cache_key, [c.model_dump() for c in cats], ttl_seconds=300)
-    return cats
-
+# ==========================================
+# 2. PRODUCT DETAILS & RELATED DATA
+# ==========================================
 
 @router.get("/{product_id}", response_model=ProductRead)
 async def get_product(product_id: uuid.UUID, db: AsyncSession = Depends(get_db)) -> Product:
@@ -186,7 +260,73 @@ async def get_product(product_id: uuid.UUID, db: AsyncSession = Depends(get_db))
     return product
 
 
-# --- Product Reviews Endpoints ---
+@router.get("/{product_id}/similar", response_model=list[ProductRead])
+async def get_similar_products(
+    product_id: uuid.UUID,
+    limit: int = Query(5, ge=1, le=20),
+    db: AsyncSession = Depends(get_db),
+) -> list[Product]:
+    """Fetch similar products in the same category (or fallback to top-rated items)."""
+    product = await db.get(Product, product_id)
+    if product is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Product not found")
+
+    query = select(Product).where(Product.id != product_id)
+    if product.category:
+        query = query.where(Product.category == product.category)
+
+    results = list(
+        (await db.execute(query.order_by(Product.rating.desc(), Product.created_at.desc()).limit(limit))).scalars().all()
+    )
+
+    # Fallback to general popular items if same category has fewer than requested
+    if len(results) < limit:
+        additional_needed = limit - len(results)
+        existing_ids = [p.id for p in results] + [product_id]
+        fallback_stmt = (
+            select(Product)
+            .where(Product.id.not_in(existing_ids))
+            .order_by(Product.rating.desc(), Product.created_at.desc())
+            .limit(additional_needed)
+        )
+        fallback_results = list((await db.execute(fallback_stmt)).scalars().all())
+        results.extend(fallback_results)
+
+    return results
+
+
+@router.get("/{product_id}/ratings-summary", response_model=ProductRatingsSummary)
+async def get_product_ratings_summary(
+    product_id: uuid.UUID,
+    db: AsyncSession = Depends(get_db),
+) -> ProductRatingsSummary:
+    """Provides ratings aggregate score and breakdown histogram (5, 4, 3, 2, 1 stars)."""
+    product = await db.get(Product, product_id)
+    if product is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Product not found")
+
+    stmt = (
+        select(Review.rating, func.count(Review.id))
+        .where(Review.product_id == product_id)
+        .group_by(Review.rating)
+    )
+    result = await db.execute(stmt)
+    counts_map = dict(result.all())
+
+    total = product.reviews_count or sum(counts_map.values()) or 0
+
+    breakdown = []
+    for star in range(5, 0, -1):
+        c = counts_map.get(star, 0)
+        pct = round((c / total * 100.0), 1) if total > 0 else 0.0
+        breakdown.append(RatingCount(stars=star, count=c, percentage=pct))
+
+    return ProductRatingsSummary(
+        average_rating=product.rating,
+        reviews_count=total,
+        breakdown=breakdown,
+    )
+
 
 @router.get("/{product_id}/reviews", response_model=CursorPage[ReviewRead])
 async def list_product_reviews(
@@ -207,8 +347,8 @@ async def list_product_reviews(
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Product not found")
 
     query = select(Review).where(Review.product_id == product_id)
-    is_backward = before is not None
 
+    is_backward = before is not None
     if after:
         try:
             val_str, cursor_id = decode_cursor(after)
@@ -234,7 +374,6 @@ async def list_product_reviews(
         query = query.order_by(Review.created_at.desc(), Review.id.desc())
 
     reviews = list((await db.execute(query.limit(limit + 1))).scalars().all())
-
     has_more = len(reviews) > limit
     page_reviews = reviews[:limit]
 
@@ -325,7 +464,9 @@ async def create_product_review(
     )
 
 
-# --- Product Creation, Update, Deletion & Cloudflare R2 Upload ---
+# ==========================================
+# 3. SELLER MUTATIONS & R2 UPLOADS
+# ==========================================
 
 @router.post("", response_model=ProductRead, status_code=status.HTTP_201_CREATED)
 async def create_product(
@@ -345,6 +486,7 @@ async def create_product(
     await db.commit()
     await db.refresh(product)
     await cache_service.invalidate_prefix("catalog:categories")
+    await cache_service.invalidate_prefix("storefront:homepage")
     return product
 
 
@@ -355,7 +497,7 @@ async def upload_product_image(
     db: AsyncSession = Depends(get_db),
     seller: User = Depends(require_seller),
 ) -> Product:
-    """Stream file into memory (max 5 MB), upload to Cloudflare R2, and update image_url."""
+    """Stream primary product image to Cloudflare R2 and update image_url."""
     product = await db.get(Product, product_id)
     if product is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Product not found")
@@ -384,9 +526,8 @@ async def upload_product_image(
     ext = ext_map.get(content_type, ".jpg")
     filename = f"products/{product_id}_{uuid.uuid4().hex[:8]}{ext}"
 
-    # Read and enforce max size
     file_bytes = bytearray()
-    chunk_size = 1024 * 1024  # 1 MB chunks
+    chunk_size = 1024 * 1024
     while chunk := await file.read(chunk_size):
         file_bytes.extend(chunk)
         if len(file_bytes) > settings.MAX_IMAGE_SIZE_BYTES:
@@ -395,13 +536,70 @@ async def upload_product_image(
                 detail=f"File exceeds maximum allowed size of {settings.MAX_IMAGE_SIZE_BYTES // (1024 * 1024)} MB",
             )
 
-    # Clean up previous R2 asset if one was set
     if product.image_url:
         await storage_service.delete_file(product.image_url)
 
-    # Upload to Cloudflare R2
     public_url = await storage_service.upload_file(bytes(file_bytes), filename, content_type)
     product.image_url = public_url
+
+    await db.commit()
+    await db.refresh(product)
+    await cache_service.invalidate_prefix("storefront:homepage")
+    return product
+
+
+@router.post("/{product_id}/gallery-image", response_model=ProductRead)
+async def upload_product_gallery_image(
+    product_id: uuid.UUID,
+    file: UploadFile = File(...),
+    db: AsyncSession = Depends(get_db),
+    seller: User = Depends(require_seller),
+) -> Product:
+    """Stream a gallery image to Cloudflare R2 and append to gallery_images array."""
+    product = await db.get(Product, product_id)
+    if product is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Product not found")
+
+    if seller.role != UserRole.SUPER_ADMIN and (
+        product.owner_id is None or product.owner_id != seller.id
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="You can only upload images for your own products",
+        )
+
+    content_type = (file.content_type or "").lower()
+    if content_type not in settings.ALLOWED_IMAGE_TYPES:
+        raise HTTPException(
+            status_code=status.HTTP_415_UNSUPPORTED_MEDIA_TYPE,
+            detail=f"Unsupported file type. Allowed: {', '.join(settings.ALLOWED_IMAGE_TYPES)}",
+        )
+
+    ext_map = {
+        "image/jpeg": ".jpg",
+        "image/png": ".png",
+        "image/webp": ".webp",
+        "image/avif": ".avif",
+    }
+    ext = ext_map.get(content_type, ".jpg")
+    filename = f"products/{product_id}_gallery_{uuid.uuid4().hex[:8]}{ext}"
+
+    file_bytes = bytearray()
+    chunk_size = 1024 * 1024
+    while chunk := await file.read(chunk_size):
+        file_bytes.extend(chunk)
+        if len(file_bytes) > settings.MAX_IMAGE_SIZE_BYTES:
+            raise HTTPException(
+                status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+                detail=f"File exceeds maximum allowed size of {settings.MAX_IMAGE_SIZE_BYTES // (1024 * 1024)} MB",
+            )
+
+    public_url = await storage_service.upload_file(bytes(file_bytes), filename, content_type)
+
+    # Re-assign list so SQLAlchemy change tracker detects update
+    existing_gallery = list(product.gallery_images or [])
+    existing_gallery.append(public_url)
+    product.gallery_images = existing_gallery
 
     await db.commit()
     await db.refresh(product)
@@ -433,6 +631,7 @@ async def update_product(
     await db.commit()
     await db.refresh(product)
     await cache_service.invalidate_prefix("catalog:categories")
+    await cache_service.invalidate_prefix("storefront:homepage")
     return product
 
 
@@ -454,6 +653,11 @@ async def delete_product(
     if product.image_url:
         await storage_service.delete_file(product.image_url)
 
+    if product.gallery_images:
+        for img in product.gallery_images:
+            await storage_service.delete_file(img)
+
     await db.delete(product)
     await db.commit()
     await cache_service.invalidate_prefix("catalog:categories")
+    await cache_service.invalidate_prefix("storefront:homepage")

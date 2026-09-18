@@ -56,6 +56,20 @@ class Settings(BaseSettings):
     # CORS
     CORS_ORIGINS: list[str] = Field(default_factory=lambda: ["http://localhost:3000"])
 
+    # Email Dispatch Configuration
+    EMAIL_PROVIDER: str = "resend"  # "resend" or "ensend"
+    EMAILS_FROM: str = "BLHMI Support <noreply@blhmisupplement.com>"
+
+    # Resend Provider Credentials
+    RESEND_API_KEY: str = ""
+
+    # Ensend Provider Credentials
+    ENSEND_PROJECT_SECRET: str = ""
+    ENSEND_SENDER_NAME: str = "BLHMI Supplements"
+    ENSEND_SENDER_ADDRESS: str = ""
+
+    OTP_EXPIRE_SECONDS: int = 600  # 10 minutes
+
 
 @lru_cache
 def get_settings() -> Settings:

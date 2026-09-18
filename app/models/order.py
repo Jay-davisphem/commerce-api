@@ -55,7 +55,6 @@ class Order(Base, TimestampMixin):
         nullable=True,
         index=True,
     )
-
     delivery_recipient_name: Mapped[str | None] = mapped_column(String(255), nullable=True)
     delivery_phone: Mapped[str | None] = mapped_column(String(50), nullable=True)
     delivery_address_line1: Mapped[str] = mapped_column(String(255), nullable=False)
@@ -67,6 +66,13 @@ class Order(Base, TimestampMixin):
     delivery_notes: Mapped[str | None] = mapped_column(Text, nullable=True)
 
     total_amount: Mapped[Decimal] = mapped_column(Numeric(12, 2), nullable=False)
+    escrow_fee: Mapped[Decimal] = mapped_column(
+        Numeric(12, 2),
+        default=Decimal("500.00"),
+        server_default="500.00",
+        nullable=False,
+    )
+
     status: Mapped[OrderStatus] = mapped_column(
         Enum(OrderStatus, name="order_status"),
         default=OrderStatus.PENDING,
@@ -78,7 +84,6 @@ class Order(Base, TimestampMixin):
         default=PaymentStatus.UNPAID,
         nullable=False,
     )
-
     order_source: Mapped[str] = mapped_column(
         String(20),
         default="ONLINE",
@@ -90,6 +95,8 @@ class Order(Base, TimestampMixin):
     paystack_access_code: Mapped[str | None] = mapped_column(String(255), nullable=True)
     paystack_authorization_url: Mapped[str | None] = mapped_column(String(1024), nullable=True)
     paid_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    in_transit_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    delivered_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
     items: Mapped[list["OrderItem"]] = relationship(
         back_populates="order",
@@ -111,6 +118,10 @@ class Order(Base, TimestampMixin):
         if self.user and self.user.full_name:
             return self.user.full_name
         return "Customer"
+
+    @property
+    def subtotal(self) -> Decimal:
+        return sum((item.line_total for item in self.items), Decimal("0.00"))
 
     def __repr__(self) -> str:
         return (

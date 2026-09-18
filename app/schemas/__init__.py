@@ -10,22 +10,39 @@ from app.schemas.order import (
 )
 from app.schemas.pagination import CursorPage, decode_cursor, encode_cursor
 from app.schemas.paystack import PaystackEventData, PaystackWebhook, PaymentVerification
-from app.schemas.product import CategoryRead, ProductCreate, ProductRead, ProductUpdate
+from app.schemas.product import (
+    CategoryRead,
+    ProductCreate,
+    ProductRatingsSummary,
+    ProductRead,
+    ProductUpdate,
+    RatingCount,
+    StorefrontHomeResponse,
+)
 from app.schemas.review import ReviewCreate, ReviewRead
 from app.schemas.seller import (
+    BuyerInfo,
+    InventorySummaryStats,
     LowStockAlertItem,
     RecentOrderSummary,
     RestockRequest,
     SellerDashboardStats,
+    SellerOrderDetail,
     SellerOrderStatusUpdate,
+    TimelineStep,
 )
 from app.schemas.user import (
     DeliveryDetailsUpdate,
+    ForgotPasswordRequest,
     LoginRequest,
+    PasswordChangeRequest,
+    ResetPasswordRequest,
     TokenResponse,
     UserCreate,
+    UserProfileUpdate,
     UserRead,
     UserRegister,
+    VerifyOTPRequest,
 )
 
 __all__ = [
@@ -47,17 +64,29 @@ __all__ = [
     "ProductRead",
     "ProductUpdate",
     "CategoryRead",
+    "RatingCount",
+    "ProductRatingsSummary",
+    "StorefrontHomeResponse",
     "ReviewCreate",
     "ReviewRead",
+    "InventorySummaryStats",
     "LowStockAlertItem",
     "RecentOrderSummary",
     "RestockRequest",
     "SellerDashboardStats",
     "SellerOrderStatusUpdate",
+    "TimelineStep",
+    "BuyerInfo",
+    "SellerOrderDetail",
     "LoginRequest",
     "TokenResponse",
     "UserCreate",
     "UserRead",
     "UserRegister",
+    "UserProfileUpdate",
+    "PasswordChangeRequest",
     "DeliveryDetailsUpdate",
+    "ForgotPasswordRequest",
+    "VerifyOTPRequest",
+    "ResetPasswordRequest",
 ]

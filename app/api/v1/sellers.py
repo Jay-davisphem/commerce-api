@@ -1,25 +1,31 @@
 from __future__ import annotations
 
 import uuid
-from datetime import datetime, time
+from datetime import date, datetime, time, timezone
 from decimal import Decimal
 from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy import and_, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import joinedload, selectinload
 
 from app.core.database import get_db
-from app.models import Order, OrderStatus, Product, Review, User, UserRole
+from app.models import Order, OrderItem, OrderStatus, PaymentStatus, Product, Review, User, UserRole
+from app.schemas.order import DeliveryAddress, OrderItemRead
 from app.schemas.pagination import CursorPage, decode_cursor, encode_cursor
 from app.schemas.product import ProductRead
 from app.schemas.review import ReviewRead
 from app.schemas.seller import (
+    BuyerInfo,
+    InventorySummaryStats,
     LowStockAlertItem,
     RecentOrderSummary,
     RestockRequest,
     SellerDashboardStats,
+    SellerOrderDetail,
     SellerOrderStatusUpdate,
+    TimelineStep,
 )
 from app.services.auth import require_seller
 
@@ -27,19 +33,44 @@ router = APIRouter(prefix="/sellers", tags=["Sellers"])
 
 
 # ==========================================
-# 1. SELLER INVENTORY (BIDIRECTIONAL CURSOR)
+# 1. SELLER INVENTORY (BIDIRECTIONAL CURSOR & STATS)
 # ==========================================
+
+@router.get("/inventory/stats", response_model=InventorySummaryStats)
+async def get_inventory_stats(
+    db: AsyncSession = Depends(get_db),
+    seller: User = Depends(require_seller),
+) -> InventorySummaryStats:
+    low_stock_filter = (
+        Product.owner_id == seller.id
+        if seller.role != UserRole.SUPER_ADMIN
+        else True
+    )
+
+    total_stmt = select(func.count(Product.id)).where(low_stock_filter)
+    total_count = (await db.execute(total_stmt)).scalar_one() or 0
+
+    stock_condition = Product.inventory_count <= Product.low_stock_threshold
+    count_low_stmt = select(func.count(Product.id)).where(
+        low_stock_filter, stock_condition
+    )
+    low_stock_count = (await db.execute(count_low_stmt)).scalar_one() or 0
+
+    return InventorySummaryStats(
+        total_products=total_count,
+        low_stock_count=low_stock_count,
+    )
+
 
 @router.get("/products", response_model=CursorPage[ProductRead])
 async def list_my_products(
     db: AsyncSession = Depends(get_db),
     seller: User = Depends(require_seller),
-    q: Optional[str] = Query(None, description="Search own products by title"),
+    q: Optional[str] = Query(None, description="Search own products by title or SKU"),
     after: Optional[str] = Query(None, description="Fetch products after this cursor (Next page)"),
     before: Optional[str] = Query(None, description="Fetch products before this cursor (Previous page)"),
     limit: int = Query(10, ge=1, le=100),
 ) -> CursorPage[ProductRead]:
-    """List products owned exclusively by the seller with bidirectional cursor pagination."""
     if after and before:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
@@ -49,10 +80,14 @@ async def list_my_products(
     query = select(Product).where(Product.owner_id == seller.id)
 
     if q:
-        query = query.where(Product.title.ilike(f"%{q}%"))
+        query = query.where(
+            or_(
+                Product.title.ilike(f"%{q}%"),
+                Product.sku.ilike(f"%{q}%"),
+            )
+        )
 
     is_backward = before is not None
-
     if after:
         try:
             val_str, cursor_id = decode_cursor(after)
@@ -78,7 +113,6 @@ async def list_my_products(
         except Exception:
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid pagination cursor")
 
-    # Invert sorting on backward navigation
     if is_backward:
         query = query.order_by(Product.created_at.asc(), Product.id.asc())
     else:
@@ -119,20 +153,49 @@ async def list_my_products(
 async def get_seller_dashboard(
     db: AsyncSession = Depends(get_db),
     seller: User = Depends(require_seller),
+    start_date: Optional[date] = Query(None, description="Start date (YYYY-MM-DD)"),
+    end_date: Optional[date] = Query(None, description="End date (YYYY-MM-DD)"),
+    all_time: bool = Query(False, description="Fetch all-time metrics without date restriction"),
 ) -> SellerDashboardStats:
-    today_start = datetime.combine(datetime.utcnow().date(), time.min)
+    if start_date and end_date and start_date > end_date:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="start_date cannot be later than end_date",
+        )
 
-    online_stmt = select(func.count(Order.id)).where(
-        Order.created_at >= today_start,
-        Order.order_source == "ONLINE",
-    )
-    online_orders_today = (await db.execute(online_stmt)).scalar_one() or 0
+    date_conditions = []
+    if not all_time:
+        if start_date is None and end_date is None:
+            today = datetime.now(timezone.utc).date()
+            start_dt = datetime.combine(today, time.min, tzinfo=timezone.utc)
+            end_dt = datetime.combine(today, time.max, tzinfo=timezone.utc)
+            date_conditions.extend([Order.created_at >= start_dt, Order.created_at <= end_dt])
+        else:
+            if start_date:
+                start_dt = datetime.combine(start_date, time.min, tzinfo=timezone.utc)
+                date_conditions.append(Order.created_at >= start_dt)
+            if end_date:
+                end_dt = datetime.combine(end_date, time.max, tzinfo=timezone.utc)
+                date_conditions.append(Order.created_at <= end_dt)
 
-    pos_stmt = select(func.coalesce(func.sum(Order.total_amount), Decimal("0.00"))).where(
-        Order.created_at >= today_start,
-        Order.order_source == "POS",
-    )
-    pos_sales_today = (await db.execute(pos_stmt)).scalar_one() or Decimal("0.00")
+    orders_stmt = select(func.count(Order.id))
+    if date_conditions:
+        orders_stmt = orders_stmt.where(and_(*date_conditions))
+    total_orders_count = (await db.execute(orders_stmt)).scalar_one() or 0
+
+    paid_statuses = [
+        OrderStatus.PAID,
+        OrderStatus.IN_ESCROW,
+        OrderStatus.IN_TRANSIT,
+        OrderStatus.DELIVERED,
+    ]
+    sales_conditions = list(date_conditions)
+    sales_conditions.append(Order.status.in_(paid_statuses))
+
+    sales_stmt = select(
+        func.coalesce(func.sum(Order.total_amount), Decimal("0.00"))
+    ).where(and_(*sales_conditions))
+    total_sales_amount = (await db.execute(sales_stmt)).scalar_one() or Decimal("0.00")
 
     escrow_stmt = select(func.coalesce(func.sum(Order.total_amount), Decimal("0.00"))).where(
         Order.status.in_([OrderStatus.PAID, OrderStatus.IN_ESCROW, OrderStatus.IN_TRANSIT])
@@ -161,14 +224,15 @@ async def get_seller_dashboard(
 
     recent_orders_stmt = (
         select(Order)
+        .options(selectinload(Order.items).joinedload(OrderItem.product))
         .order_by(Order.created_at.desc())
         .limit(5)
     )
     recent_orders_rows = (await db.execute(recent_orders_stmt)).scalars().all()
 
     return SellerDashboardStats(
-        online_orders_today=online_orders_today,
-        pos_sales_today=pos_sales_today,
+        total_orders=total_orders_count,
+        today_sales=total_sales_amount,
         goods_in_escrow=goods_in_escrow,
         low_stock_alerts=low_stock_count,
         low_stock_items=[
@@ -188,9 +252,15 @@ async def get_seller_dashboard(
                 total_amount=o.total_amount,
                 status=o.status.value.replace("_", " ").title(),
                 created_at=o.created_at,
+                items_preview=[
+                    f"{it.product.title if it.product else 'Item'} x{it.quantity}"
+                    for it in o.items
+                ],
             )
             for o in recent_orders_rows
         ],
+        online_orders_today=total_orders_count,
+        pos_sales_today=total_sales_amount,
     )
 
 
@@ -206,7 +276,6 @@ async def list_seller_reviews(
     before: Optional[str] = Query(None, description="Fetch reviews before this cursor (Previous page)"),
     limit: int = Query(10, ge=1, le=50),
 ) -> CursorPage[ReviewRead]:
-    """Fetch reviews for products owned by this seller with bidirectional cursor pagination."""
     if after and before:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
@@ -220,7 +289,6 @@ async def list_seller_reviews(
     )
 
     is_backward = before is not None
-
     if after:
         try:
             val_str, cursor_id = decode_cursor(after)
@@ -252,7 +320,6 @@ async def list_seller_reviews(
         query = query.order_by(Review.created_at.desc(), Review.id.desc())
 
     results = list((await db.execute(query.limit(limit + 1))).all())
-
     has_more = len(results) > limit
     page_results = results[:limit]
 
@@ -292,31 +359,41 @@ async def list_seller_reviews(
 
 
 # ==========================================
-# 4. SELLER ORDERS (BIDIRECTIONAL CURSOR)
+# 4. SELLER ORDERS (BIDIRECTIONAL CURSOR & DETAILS)
 # ==========================================
 
 @router.get("/orders", response_model=CursorPage[RecentOrderSummary])
 async def list_seller_orders(
     db: AsyncSession = Depends(get_db),
     seller: User = Depends(require_seller),
-    status_filter: Optional[str] = Query(None, alias="status"),
+    status_filter: Optional[str] = Query(None, alias="status", description="awaiting_delivery, delivered, cancelled"),
     search: Optional[str] = Query(None),
     after: Optional[str] = Query(None, description="Fetch orders after this cursor (Next page)"),
     before: Optional[str] = Query(None, description="Fetch orders before this cursor (Previous page)"),
     limit: int = Query(10, ge=1, le=50),
 ) -> CursorPage[RecentOrderSummary]:
-    """Search and filter customer orders with bidirectional cursor pagination."""
     if after and before:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="Cannot provide both 'after' and 'before' cursors simultaneously",
         )
 
-    query = select(Order)
+    query = select(Order).options(selectinload(Order.items).joinedload(OrderItem.product))
 
+    # Support UI tab filters
     if status_filter:
-        canonical_status = status_filter.lower().replace(" ", "_")
-        query = query.where(Order.status == canonical_status)
+        norm = status_filter.lower().strip().replace(" ", "_")
+        if norm == "awaiting_delivery":
+            query = query.where(Order.status.in_([OrderStatus.PAID, OrderStatus.IN_ESCROW, OrderStatus.IN_TRANSIT]))
+        elif norm == "delivered":
+            query = query.where(Order.status == OrderStatus.DELIVERED)
+        elif norm == "cancelled":
+            query = query.where(Order.status.in_([OrderStatus.CANCELLED, OrderStatus.FAILED]))
+        else:
+            try:
+                query = query.where(Order.status == OrderStatus(norm))
+            except ValueError:
+                pass
 
     if search:
         query = query.where(
@@ -327,7 +404,6 @@ async def list_seller_orders(
         )
 
     is_backward = before is not None
-
     if after:
         try:
             val_str, cursor_id = decode_cursor(after)
@@ -359,7 +435,6 @@ async def list_seller_orders(
         query = query.order_by(Order.created_at.desc(), Order.id.desc())
 
     orders = list((await db.execute(query.limit(limit + 1))).scalars().all())
-
     has_more = len(orders) > limit
     page_orders = orders[:limit]
 
@@ -379,6 +454,10 @@ async def list_seller_orders(
             total_amount=o.total_amount,
             status=o.status.value.replace("_", " ").title(),
             created_at=o.created_at,
+            items_preview=[
+                f"{it.product.title if it.product else 'Item'} x{it.quantity}"
+                for it in o.items
+            ],
         )
         for o in page_orders
     ]
@@ -393,6 +472,108 @@ async def list_seller_orders(
         has_next=has_next,
         has_prev=has_prev,
         limit=limit,
+    )
+
+
+@router.get("/orders/{order_id}", response_model=SellerOrderDetail)
+async def get_seller_order_detail(
+    order_id: uuid.UUID,
+    db: AsyncSession = Depends(get_db),
+    seller: User = Depends(require_seller),
+) -> SellerOrderDetail:
+    stmt = (
+        select(Order)
+        .where(Order.id == order_id)
+        .options(selectinload(Order.items).joinedload(OrderItem.product))
+    )
+    order = (await db.execute(stmt)).scalar_one_or_none()
+    if order is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Order not found")
+
+    # Construct the 5-step lifecycle timeline
+    is_paid = order.status in (OrderStatus.PAID, OrderStatus.IN_ESCROW, OrderStatus.IN_TRANSIT, OrderStatus.DELIVERED)
+    timeline = [
+        TimelineStep(
+            step_key="order_placed",
+            title="Order Placed",
+            status="completed",
+            timestamp=order.created_at,
+        ),
+        TimelineStep(
+            step_key="payment_secured",
+            title="Payment Secured (Escrow)",
+            status="completed" if is_paid else "pending",
+            timestamp=order.paid_at or (order.created_at if is_paid else None),
+        ),
+        TimelineStep(
+            step_key="awaiting_pickup",
+            title="Awaiting Pickup",
+            status="completed" if order.status in (OrderStatus.IN_TRANSIT, OrderStatus.DELIVERED)
+            else ("current" if order.status in (OrderStatus.PAID, OrderStatus.IN_ESCROW) else "pending"),
+            timestamp=None,
+        ),
+        TimelineStep(
+            step_key="in_transit",
+            title="In Transit",
+            status="completed" if order.status == OrderStatus.DELIVERED
+            else ("current" if order.status == OrderStatus.IN_TRANSIT else "pending"),
+            timestamp=order.in_transit_at,
+        ),
+        TimelineStep(
+            step_key="delivery",
+            title="Delivery",
+            status="completed" if order.status == OrderStatus.DELIVERED else "pending",
+            timestamp=order.delivered_at,
+        ),
+    ]
+
+    status_formatted = order.status.value.replace("_", " ").title()
+    status_label = f"{status_formatted} - Payment Secured" if is_paid else f"{status_formatted} - Unpaid"
+
+    buyer_info = BuyerInfo(
+        guest_email=order.guest_email,
+        recipient_name=order.delivery_recipient_name or order.customer_name,
+        phone=order.delivery_phone,
+        address=DeliveryAddress(
+            recipient_name=order.delivery_recipient_name,
+            phone=order.delivery_phone,
+            address_line1=order.delivery_address_line1,
+            address_line2=order.delivery_address_line2,
+            city=order.delivery_city,
+            state=order.delivery_state,
+            postal_code=order.delivery_postal_code,
+            country=order.delivery_country,
+            notes=order.delivery_notes,
+        ),
+    )
+
+    items_read = [
+        OrderItemRead(
+            id=it.id,
+            product_id=it.product_id,
+            product_title=it.product.title if it.product else "Item",
+            quantity=it.quantity,
+            unit_price=it.unit_price,
+            line_total=it.line_total,
+        )
+        for it in order.items
+    ]
+
+    return SellerOrderDetail(
+        id=order.id,
+        order_reference=order.order_reference,
+        status=order.status.value,
+        status_label=status_label,
+        payment_status=order.payment_status.value,
+        total_amount=order.total_amount,
+        subtotal=order.subtotal,
+        escrow_fee=order.escrow_fee,
+        created_at=order.created_at,
+        paid_at=order.paid_at,
+        items=items_read,
+        buyer_info=buyer_info,
+        timeline=timeline,
+        escrow_banner_message="Funds will be released after buyer confirms delivery.",
     )
 
 
@@ -412,12 +593,24 @@ async def update_order_status(
 
     normalized_status = payload.status.lower().replace(" ", "_")
     try:
-        order.status = OrderStatus(normalized_status)
+        new_status = OrderStatus(normalized_status)
+        order.status = new_status
     except ValueError:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=f"Invalid order status: {payload.status}",
         )
+
+    now = datetime.now(timezone.utc)
+    if new_status == OrderStatus.IN_TRANSIT and not order.in_transit_at:
+        order.in_transit_at = now
+    elif new_status == OrderStatus.DELIVERED:
+        if not order.delivered_at:
+            order.delivered_at = now
+        order.payment_status = PaymentStatus.PAID
+    elif new_status in (OrderStatus.PAID, OrderStatus.IN_ESCROW) and not order.paid_at:
+        order.paid_at = now
+        order.payment_status = PaymentStatus.PAID
 
     await db.commit()
     return {"message": "Order status updated", "status": order.status.value}
@@ -448,7 +641,6 @@ async def restock_product(
     product.inventory_count += payload.quantity
     await db.commit()
     await db.refresh(product)
-
     return {
         "message": "Product restocked successfully",
         "product_id": str(product.id),

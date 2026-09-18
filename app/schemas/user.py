@@ -4,8 +4,7 @@ from __future__ import annotations
 
 import uuid
 from datetime import datetime
-
-from pydantic import BaseModel, ConfigDict, EmailStr, Field
+from pydantic import BaseModel, ConfigDict, EmailStr, Field, model_validator
 
 from app.models.user import UserRole
 
@@ -30,6 +29,28 @@ class UserCreate(BaseModel):
 class LoginRequest(BaseModel):
     email: EmailStr
     password: str
+
+
+class UserProfileUpdate(BaseModel):
+    """Card 1: Profile update."""
+
+    full_name: str = Field(..., min_length=1, max_length=255)
+
+
+class PasswordChangeRequest(BaseModel):
+    """Card 2: Security password update."""
+
+    current_password: str = Field(..., min_length=1)
+    new_password: str = Field(..., min_length=8, max_length=128)
+    confirm_password: str = Field(..., min_length=8, max_length=128)
+
+    @model_validator(mode="after")
+    def verify_password_match(self) -> PasswordChangeRequest:
+        if self.new_password != self.confirm_password:
+            raise ValueError("New password and confirm password do not match")
+        if self.current_password == self.new_password:
+            raise ValueError("New password must be different from current password")
+        return self
 
 
 class DeliveryDetailsUpdate(BaseModel):
@@ -60,7 +81,7 @@ class UserRead(BaseModel):
     full_name: str | None
     role: UserRole
     created_at: datetime
-    # Saved default delivery details (nullable until set).
+
     default_recipient_name: str | None = None
     default_phone: str | None = None
     default_address_line1: str | None = None
@@ -72,5 +93,27 @@ class UserRead(BaseModel):
     default_notes: str | None = None
 
 
-# Resolve forward ref for TokenResponse → UserRead.
 TokenResponse.model_rebuild()
+
+
+
+class ForgotPasswordRequest(BaseModel):
+    email: EmailStr
+
+
+class VerifyOTPRequest(BaseModel):
+    email: EmailStr
+    code: str = Field(..., min_length=6, max_length=6)
+
+
+class ResetPasswordRequest(BaseModel):
+    email: EmailStr
+    code: str = Field(..., min_length=6, max_length=6)
+    new_password: str = Field(..., min_length=8, max_length=128)
+    confirm_password: str = Field(..., min_length=8, max_length=128)
+
+    @model_validator(mode="after")
+    def verify_match(self) -> ResetPasswordRequest:
+        if self.new_password != self.confirm_password:
+            raise ValueError("New password and confirm password do not match")
+        return self

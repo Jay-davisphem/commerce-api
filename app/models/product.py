@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import uuid
 from decimal import Decimal
+from typing import Any
 
 from sqlalchemy import (
     BigInteger,
@@ -9,6 +10,7 @@ from sqlalchemy import (
     ForeignKey,
     Index,
     Integer,
+    JSON,
     Numeric,
     String,
     Text,
@@ -45,17 +47,28 @@ class Product(Base, UUIDPrimaryKeyMixin, TimestampMixin):
     )
 
     title: Mapped[str] = mapped_column(String(255), nullable=False)
+    sku: Mapped[str | None] = mapped_column(String(100), nullable=True, index=True)
     description: Mapped[str | None] = mapped_column(Text, nullable=True)
     price: Mapped[Decimal] = mapped_column(Numeric(12, 2), nullable=False)
     inventory_count: Mapped[int] = mapped_column(BigInteger, default=0, nullable=False)
     image_url: Mapped[str | None] = mapped_column(String(1024), nullable=True)
-
+    gallery_images: Mapped[list[str]] = mapped_column(
+        JSON,
+        default=list,
+        server_default="[]",
+        nullable=False,
+    )
+    specifications: Mapped[dict[str, Any]] = mapped_column(
+        JSON,
+        default=dict,
+        server_default="{}",
+        nullable=False,
+    )
     category: Mapped[str | None] = mapped_column(String(100), nullable=True, index=True)
     original_price: Mapped[Decimal | None] = mapped_column(Numeric(12, 2), nullable=True)
     discount_percentage: Mapped[int] = mapped_column(Integer, default=0, nullable=False, server_default="0")
     low_stock_threshold: Mapped[int] = mapped_column(Integer, default=15, nullable=False, server_default="15")
     tag: Mapped[str | None] = mapped_column(String(50), nullable=True, index=True)
-
     rating: Mapped[Decimal] = mapped_column(Numeric(2, 1), default=Decimal("5.0"), server_default="5.0", nullable=False)
     reviews_count: Mapped[int] = mapped_column(Integer, default=0, server_default="0", nullable=False)
 
@@ -77,7 +90,7 @@ class Product(Base, UUIDPrimaryKeyMixin, TimestampMixin):
     owner: Mapped["User | None"] = relationship(back_populates="products")
 
     def __repr__(self) -> str:
-        return f"<Product id={self.id} title={self.title!r} price={self.price} rating={self.rating}>"
+        return f"<Product id={self.id} title={self.title!r} sku={self.sku!r} price={self.price} rating={self.rating}>"
 
 
 from app.models.order_item import OrderItem  # noqa: E402

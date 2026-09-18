@@ -3,9 +3,7 @@ from __future__ import annotations
 import uuid
 from datetime import datetime
 from decimal import Decimal
-
 from pydantic import BaseModel, ConfigDict, EmailStr, Field
-
 from app.models.order import OrderStatus, PaymentStatus
 
 
@@ -34,18 +32,17 @@ class CheckoutRequest(BaseModel):
 
 
 class OrderItemRead(BaseModel):
-    model_config = ConfigDict(from_attributes=True)
-
     id: uuid.UUID
     product_id: uuid.UUID
+    product_title: str | None = None
     quantity: int
     unit_price: Decimal
     line_total: Decimal
 
-
-class OrderRead(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
+
+class OrderRead(BaseModel):
     id: uuid.UUID
     guest_email: EmailStr
     delivery: DeliveryAddress | None = None
@@ -57,8 +54,9 @@ class OrderRead(BaseModel):
     created_at: datetime
     items: list[OrderItemRead] = []
 
+    model_config = ConfigDict(from_attributes=True)
 
-# Export alias so legacy imports do not break
+
 OrderResponse = OrderRead
 
 
