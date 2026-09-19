@@ -9,9 +9,11 @@ from datetime import datetime, timezone
 from fastapi import HTTPException, Request, status
 from sqlalchemy import or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import selectinload
 
-from app.models import Order, OrderStatus, PaymentStatus
+from app.models import Order, OrderItem, OrderStatus, PaymentStatus
 from app.schemas.paystack import PaystackWebhook
+from app.services.email import email_service
 from app.services.paystack import paystack
 from app.services.stripe import stripe_service
 
@@ -39,7 +41,11 @@ class PaystackWebhookHandler:
 
     async def _mark_paid(self, event: PaystackWebhook) -> None:
         reference = event.data.reference
-        stmt = select(Order).where(Order.paystack_reference == reference)
+        stmt = (
+            select(Order)
+            .where(Order.paystack_reference == reference)
+            .options(selectinload(Order.items).joinedload(OrderItem.product))
+        )
         result = await self.db.execute(stmt)
         order_obj = result.scalar_one_or_none()
         if order_obj is None:
@@ -48,7 +54,7 @@ class PaystackWebhookHandler:
                 detail=f"No order for reference {reference}",
             )
 
-        order_obj.status = OrderStatus.PAID
+        order_obj.status = OrderStatus.IN_ESCROW
         order_obj.payment_status = PaymentStatus.PAID
 
         raw_paid_at = event.data.paid_at
@@ -63,6 +69,9 @@ class PaystackWebhookHandler:
             order_obj.paid_at = datetime.now(timezone.utc)
 
         await self.db.commit()
+
+        # Send order confirmation and payment secured in escrow email
+        await email_service.send_order_status_email(order_obj, "in_escrow")
 
 
 class StripeWebhookHandler:
@@ -111,13 +120,20 @@ class StripeWebhookHandler:
             logger.warning("Stripe webhook received without reference or order_id metadata")
             return
 
-        stmt = select(Order).where(or_(*conditions))
+        stmt = (
+            select(Order)
+            .where(or_(*conditions))
+            .options(selectinload(Order.items).joinedload(OrderItem.product))
+        )
         order = (await self.db.execute(stmt)).scalar_one_or_none()
         if order is None:
             logger.warning("No matching order found for Stripe event %s", event.get("id"))
             return
 
-        order.status = OrderStatus.PAID
+        order.status = OrderStatus.IN_ESCROW
         order.payment_status = PaymentStatus.PAID
         order.paid_at = datetime.now(timezone.utc)
         await self.db.commit()
+
+        # Send order confirmation and payment secured in escrow email
+        await email_service.send_order_status_email(order, "in_escrow")
