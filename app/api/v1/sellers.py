@@ -28,6 +28,7 @@ from app.schemas.seller import (
     TimelineStep,
 )
 from app.services.auth import require_seller
+from app.services.email import email_service
 
 router = APIRouter(prefix="/sellers", tags=["Sellers"])
 
@@ -380,7 +381,6 @@ async def list_seller_orders(
 
     query = select(Order).options(selectinload(Order.items).joinedload(OrderItem.product))
 
-    # Support UI tab filters
     if status_filter:
         norm = status_filter.lower().strip().replace(" ", "_")
         if norm == "awaiting_delivery":
@@ -490,7 +490,6 @@ async def get_seller_order_detail(
     if order is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Order not found")
 
-    # Construct the 5-step lifecycle timeline
     is_paid = order.status in (OrderStatus.PAID, OrderStatus.IN_ESCROW, OrderStatus.IN_TRANSIT, OrderStatus.DELIVERED)
     timeline = [
         TimelineStep(
@@ -584,7 +583,12 @@ async def update_order_status(
     db: AsyncSession = Depends(get_db),
     seller: User = Depends(require_seller),
 ) -> dict[str, str]:
-    order = await db.get(Order, order_id)
+    stmt = (
+        select(Order)
+        .where(Order.id == order_id)
+        .options(selectinload(Order.items).joinedload(OrderItem.product))
+    )
+    order = (await db.execute(stmt)).scalar_one_or_none()
     if order is None:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
@@ -613,6 +617,10 @@ async def update_order_status(
         order.payment_status = PaymentStatus.PAID
 
     await db.commit()
+
+    # Trigger transactional status update email to customer
+    await email_service.send_order_status_email(order, order.status.value)
+
     return {"message": "Order status updated", "status": order.status.value}
 
 

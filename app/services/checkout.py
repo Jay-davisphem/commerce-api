@@ -1,19 +1,17 @@
-"""Checkout orchestration for the one-shot (guest) checkout flow.
+"""Checkout orchestration for the one-shot (guest and authenticated) checkout flow.
 
 Responsibilities:
 1. Load products from the DB using the ids in the payload.
-2. Compute the *authoritative* total server-side — never trust client prices
-   or client totals.
+2. Compute the authoritative total server-side.
 3. Validate inventory availability.
 4. Persist the Order (status=pending) + OrderItems with price snapshots.
-5. Initialise a Paystack transaction and return the authorization_url.
+5. Initialize configured payment gateway (Paystack or Stripe) and return the checkout URL.
 """
 
 from __future__ import annotations
 
 import uuid
 from decimal import Decimal
-
 from fastapi import HTTPException, status
 from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -26,7 +24,7 @@ from app.schemas.order import (
     OrderItemRead,
     OrderRead,
 )
-from app.services.paystack import paystack
+from app.services.payment import payment_gateway
 
 
 class CheckoutError(HTTPException):
@@ -41,27 +39,17 @@ class CheckoutService:
         self.db = db
 
     async def run(self, payload: CheckoutRequest, user: User | None = None) -> CheckoutResponse:
-        """Execute the full one-shot checkout flow for the given payload.
-
-        `user` is optional — a logged-in buyer's order is linked to their
-        account (and may reuse their saved delivery details); guests
-        (user=None) remain pure guest orders and must supply delivery.
-        """
-        # 1 + 2. Load products and compute the server-side total.
+        # 1. Fetch products & validate ids
         products = await self._fetch_products([i.product_id for i in payload.items])
         by_id = {p.id: p for p in products}
-
         if len(by_id) != len(payload.items):
             missing = [str(i.product_id) for i in payload.items if i.product_id not in by_id]
             raise CheckoutError(f"Unknown product ids: {', '.join(missing)}")
 
-        # 3. Atomically reserve inventory BEFORE building the order. This uses a
-        #    guarded UPDATE so concurrent checkouts cannot oversell: the DB only
-        #    decrements while `inventory_count >= quantity`, and we abort if any
-        #    row was not affected.
+        # 2. Atomically reserve inventory
         await self._reserve_inventory(payload.items, by_id)
 
-        # Build order items with *DB* prices.
+        # 3. Compute server-side authoritative total
         order_items: list[OrderItem] = []
         total = Decimal("0.00")
         for item in payload.items:
@@ -72,26 +60,20 @@ class CheckoutService:
                 OrderItem(
                     product_id=product.id,
                     quantity=item.quantity,
-                    unit_price=product.price,  # snapshot: authoritative DB price
+                    unit_price=product.price,
                     line_total=line_total,
                 )
             )
 
-        # Resolve the buyer's email: for a logged-in user, use their account
-        # email (never trust a re-typed payload email). Guests must supply one.
         order_email = user.email if user is not None else payload.guest_email
         if not order_email:
             raise CheckoutError("guest_email is required for guest checkout")
 
-        # Resolve delivery details: a logged-in buyer either uses their saved
-        # address or submits a new one (buyer picks source). Guests must supply
-        # one. Submitting a new address also saves it as the buyer's default.
         delivery = await self._resolve_delivery(payload, user)
 
-        # 4. Persist the pending Order + items.
+        # 4. Create pending Order
         order = Order(
             guest_email=order_email,
-            # Link to the account only if the buyer is authenticated (guest = None).
             user_id=user.id if user is not None else None,
             delivery_recipient_name=delivery.recipient_name,
             delivery_phone=delivery.phone,
@@ -107,21 +89,21 @@ class CheckoutService:
         )
         order.items = order_items
         self.db.add(order)
-        await self.db.flush()  # assign order.id before generating the reference
+        await self.db.flush()
 
-        # 5. Initialise the Paystack transaction with the server-computed total.
+        # 5. Initialize configured payment provider (Paystack or Stripe)
         reference = f"ORDER-{order.id}"
-        result = await paystack.initialize_transaction(
+        result = await payment_gateway.initialize_payment(
             email=order_email,
             amount=total,
             reference=reference,
-            metadata={"order_id": str(order.id)},
+            order_id=str(order.id),
         )
+
         order.paystack_reference = reference
         order.paystack_access_code = result.get("access_code")
         order.paystack_authorization_url = result.get("authorization_url")
 
-        # Commit everything (order + payment init) atomically.
         await self.db.commit()
         await self.db.refresh(order, attribute_names=["items"])
 
@@ -140,6 +122,7 @@ class CheckoutService:
                     OrderItemRead(
                         id=it.id,
                         product_id=it.product_id,
+                        product_title=it.product.title if it.product else "Item",
                         quantity=it.quantity,
                         unit_price=it.unit_price,
                         line_total=it.line_total,
@@ -157,37 +140,6 @@ class CheckoutService:
         items: list,
         products_by_id: dict[uuid.UUID, Product],
     ) -> None:
-        """Atomically reserve stock for each requested line.
-
-        Uses a single guarded UPDATE per product:
-            SET inventory_count = inventory_count - :qty
-            WHERE id = :id AND inventory_count >= :qty
-
-        The `inventory_count >= :qty` predicate makes the decrement atomic and
-        safe under concurrency: only one of two simultaneous checkouts for the
-        last unit can succeed (rowcount == 1). If a row is *not* affected, the
-        stock ran out and we abort the whole checkout. The caller then never
-        persists the order (the transaction rolls back).False)
-    status: Mapped[OrderStatus] = mapped_column(
-        Enum(OrderStatus, name="order_status"),
-        default=OrderStatus.PENDING,
-        nullable=False,
-        index=True,
-    )
-    payment_status: Mapped[PaymentStatus] = mapped_column(
-        Enum(PaymentStatus, name="payment_status"),
-        default=PaymentStatus.UNPAID,
-        nullable=False,
-    )
-
-    order_source: Mapped[str] = mapped_column(
-        String(20),
-        default="ONLINE",
-        nullable=False,
-        server_default="ONLINE",
-    )
-
-        """
         for item in items:
             product = products_by_id[item.product_id]
             result = await self.db.execute(
@@ -196,12 +148,9 @@ class CheckoutService:
                 .values(inventory_count=Product.inventory_count - item.quantity)
                 .execution_options(synchronize_session=False)
             )
-            # rowcount == 1 means exactly one product row was decremented.
-            # 0 means the guarded predicate failed (insufficient stock).
             if result.rowcount != 1:
                 raise CheckoutError(
-                    f"Insufficient stock for '{product.title}' "
-                    f"(requested={item.quantity})"
+                    f"Insufficient stock for '{product.title}' (requested={item.quantity})"
                 )
 
     async def _resolve_delivery(
@@ -209,27 +158,13 @@ class CheckoutService:
         payload: CheckoutRequest,
         user: User | None,
     ) -> DeliveryAddress:
-        """Decide which delivery details to use and return a populated schema.
-
-        Rules ("buyer picks source"):
-        - Guest (no user): the payload must include `delivery`.
-        - Logged-in buyer with `use_saved_address=True` or no `delivery` in the
-          payload: use the account's saved details; error if none were saved.
-        - Logged-in buyer who submits `delivery`: use it AND save it back as
-          their default (so future checkouts can be prefilled).
-        """
-        # Guest checkout always requires explicit delivery details.
         if user is None:
             if payload.delivery is None:
-                raise CheckoutError(
-                    "Delivery details are required for guest checkout"
-                )
+                raise CheckoutError("Delivery details are required for guest checkout")
             return payload.delivery
 
         use_saved = payload.use_saved_address or payload.delivery is None
-
         if not use_saved:
-            # Buyer explicitly entered a new address — use it and save it as default.
             await self._save_default_delivery(user, payload.delivery)
             return payload.delivery
 
@@ -243,6 +178,7 @@ class CheckoutService:
                 "No saved delivery details on this account. "
                 "Provide delivery in the request or save an address first."
             )
+
         return DeliveryAddress(
             recipient_name=user.default_recipient_name,
             phone=user.default_phone,
@@ -256,7 +192,6 @@ class CheckoutService:
         )
 
     async def _save_default_delivery(self, user: User, delivery: DeliveryAddress) -> None:
-        """Persist a submitted delivery address as the user's default."""
         user.default_recipient_name = delivery.recipient_name
         user.default_phone = delivery.phone
         user.default_address_line1 = delivery.address_line1
@@ -266,7 +201,6 @@ class CheckoutService:
         user.default_postal_code = delivery.postal_code
         user.default_country = delivery.country
         user.default_notes = delivery.notes
-        # Flushed/committed as part of the same transaction as the order.
         self.db.add(user)
 
     async def _fetch_products(self, ids: list[uuid.UUID]) -> list[Product]:

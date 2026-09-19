@@ -158,3 +158,7 @@ class StorefrontHomeResponse(BaseModel):
     mostly_ordered: list[ProductRead]
 
     model_config = ConfigDict(from_attributes=True)
+    
+    
+class BatchProductRequest(BaseModel):
+    product_ids: list[uuid.UUID] = Field(min_length=1, max_length=50)

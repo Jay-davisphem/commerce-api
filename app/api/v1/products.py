@@ -16,6 +16,7 @@ from app.models import Product, Review, User, UserRole
 from app.models.order_item import OrderItem
 from app.schemas.pagination import CursorPage, decode_cursor, encode_cursor
 from app.schemas.product import (
+    BatchProductRequest,
     CategoryRead,
     ProductCreate,
     ProductRatingsSummary,
@@ -661,3 +662,14 @@ async def delete_product(
     await db.commit()
     await cache_service.invalidate_prefix("catalog:categories")
     await cache_service.invalidate_prefix("storefront:homepage")
+    
+
+@router.post("/batch", response_model=list[ProductRead])
+async def get_products_batch(
+    payload: BatchProductRequest,
+    db: AsyncSession = Depends(get_db),
+) -> list[Product]:
+    """Hydrates and validates client cart items stored in localStorage in a single call."""
+    stmt = select(Product).where(Product.id.in_(payload.product_ids))
+    result = await db.execute(stmt)
+    return list(result.scalars().all())

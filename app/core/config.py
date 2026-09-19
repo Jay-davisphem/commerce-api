@@ -40,11 +40,23 @@ class Settings(BaseSettings):
     R2_BUCKET_NAME: str = ""
     R2_PUBLIC_DOMAIN: str = ""  # e.g. "https://images.yourdomain.com" or "https://pub-xxx.r2.dev"
 
-    # Paystack
+    # Frontend URL (Redirect landing after checkout)
+    FRONTEND_URL: str = "http://localhost:3000"
+
+    # Active Payment Gateway: "paystack" or "stripe"
+    PAYMENT_GATEWAY: str = "paystack"
+
+    # Paystack Configuration
     PAYSTACK_SECRET_KEY: str = ""
     PAYSTACK_PUBLIC_KEY: str = ""
     PAYSTACK_BASE_URL: str = "https://api.paystack.co"
     PAYSTACK_WEBHOOK_SECRET: str = ""
+
+    # Stripe Configuration
+    STRIPE_SECRET_KEY: str = ""
+    STRIPE_PUBLIC_KEY: str = ""
+    STRIPE_WEBHOOK_SECRET: str = ""
+    STRIPE_CURRENCY: str = "ngn"  # Base catalog currency sent to Stripe
 
     # Auth
     SUPER_ADMIN_EMAIL: str = ""
@@ -60,10 +72,10 @@ class Settings(BaseSettings):
     EMAIL_PROVIDER: str = "resend"  # "resend" or "ensend"
     EMAILS_FROM: str = "BLHMI Support <noreply@blhmisupplement.com>"
 
-    # Resend Provider Credentials
+    # Resend Credentials
     RESEND_API_KEY: str = ""
 
-    # Ensend Provider Credentials
+    # Ensend Credentials
     ENSEND_PROJECT_SECRET: str = ""
     ENSEND_SENDER_NAME: str = "BLHMI Supplements"
     ENSEND_SENDER_ADDRESS: str = ""

@@ -3,7 +3,9 @@ from __future__ import annotations
 import uuid
 from datetime import datetime
 from decimal import Decimal
+from typing import Optional
 from pydantic import BaseModel, ConfigDict, EmailStr, Field
+
 from app.models.order import OrderStatus, PaymentStatus
 
 
@@ -44,6 +46,8 @@ class OrderItemRead(BaseModel):
 
 class OrderRead(BaseModel):
     id: uuid.UUID
+    order_reference: str | None = None
+    customer_name: str | None = None
     guest_email: EmailStr
     delivery: DeliveryAddress | None = None
     total_amount: Decimal
@@ -53,6 +57,7 @@ class OrderRead(BaseModel):
     paid_at: datetime | None = None
     created_at: datetime
     items: list[OrderItemRead] = []
+    items_preview: list[str] = []
 
     model_config = ConfigDict(from_attributes=True)
 
@@ -69,3 +74,37 @@ class CheckoutResponse(BaseModel):
 
 class OrderStatusUpdate(BaseModel):
     status: OrderStatus
+
+
+class TimelineStep(BaseModel):
+    step_key: str
+    title: str
+    status: str  # "completed", "current", "pending"
+    timestamp: Optional[datetime] = None
+
+
+class BuyerOrderDetail(BaseModel):
+    id: uuid.UUID
+    order_reference: str
+    status: str
+    status_label: str
+    payment_status: str
+    total_amount: Decimal
+    subtotal: Decimal
+    escrow_fee: Decimal
+    created_at: datetime
+    paid_at: Optional[datetime] = None
+    items: list[OrderItemRead]
+    delivery: DeliveryAddress
+    timeline: list[TimelineStep]
+    escrow_banner_message: str
+    can_mark_received: bool = False
+
+    model_config = ConfigDict(from_attributes=True)
+
+
+class ConfirmReceivedResponse(BaseModel):
+    message: str
+    order_id: uuid.UUID
+    order_reference: str
+    status: str
