@@ -1,8 +1,12 @@
 from __future__ import annotations
 
+from datetime import datetime, timezone
 from decimal import Decimal
 from email.utils import parseaddr
 import logging
+import os
+from pathlib import Path
+import re
 from typing import TYPE_CHECKING
 import httpx
 
@@ -17,6 +21,53 @@ logger = logging.getLogger(__name__)
 class EmailService:
     RESEND_URL = "https://api.resend.com/emails"
     ENSEND_URL = "https://api.ensend.co/send/mail"
+
+    @classmethod
+    async def _send_via_console(cls, to: str, subject: str, html_content: str) -> bool:
+        """Prints a clean, formatted inspection box in the running terminal stdout."""
+        # Extract 6-digit OTP if present in content or subject for quick copy-pasting
+        otp_match = re.search(r"\b(\d{6})\b", f"{subject} {html_content}")
+        otp_highlight = f" [OTP: {otp_match.group(1)}]" if otp_match else ""
+
+        print("\n" + "=" * 70)
+        print(f"📧 [LOCAL DEV EMAIL DISPATCH]{otp_highlight}")
+        print(f"To:      {to}")
+        print(f"From:    {settings.EMAILS_FROM}")
+        print(f"Subject: {subject}")
+        if otp_match:
+            print(f"CODE:    👉 {otp_match.group(1)} 👈")
+        print("-" * 70)
+        # Strip simple HTML tags for a clean terminal preview
+        clean_text = re.sub(r"<[^>]+>", " ", html_content)
+        clean_text = re.sub(r"\s+", " ", clean_text).strip()
+        print(f"Content:\n{clean_text[:400]}...")
+        print("=" * 70 + "\n")
+        return True
+
+    @classmethod
+    async def _send_via_file(cls, to: str, subject: str, html_content: str) -> bool:
+        """Saves rendered HTML to .local_emails/ and logs a clickable file:// link."""
+        output_dir = Path(".local_emails")
+        output_dir.mkdir(parents=True, exist_ok=True)
+
+        timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+        safe_subject = re.sub(r"[^\w\-_\. ]", "_", subject)[:30]
+        filename = f"{timestamp}_{safe_subject}.html"
+        file_path = output_dir / filename
+
+        meta_header = (
+            f"<!--\n"
+            f"To: {to}\n"
+            f"From: {settings.EMAILS_FROM}\n"
+            f"Subject: {subject}\n"
+            f"Date: {datetime.now(timezone.utc).isoformat()}\n"
+            f"-->\n"
+        )
+        file_path.write_text(meta_header + html_content, encoding="utf-8")
+
+        abs_url = file_path.resolve().as_uri()
+        print(f"\n📂 [LOCAL EMAIL SAVED] View rendered preview: {abs_url}\n")
+        return True
 
     @classmethod
     async def _send_via_resend(cls, to: str, subject: str, html_content: str) -> bool:
@@ -97,7 +148,14 @@ class EmailService:
         recipient_name: str = "Customer",
     ) -> bool:
         """Route email dispatch based on the EMAIL_PROVIDER environment setting."""
-        provider = (settings.EMAIL_PROVIDER or "resend").lower().strip()
+        provider = (settings.EMAIL_PROVIDER or "console").lower().strip()
+
+        if provider == "console":
+            return await cls._send_via_console(to=to, subject=subject, html_content=html_content)
+
+        if provider == "file":
+            await cls._send_via_console(to=to, subject=subject, html_content=html_content)
+            return await cls._send_via_file(to=to, subject=subject, html_content=html_content)
 
         if provider == "ensend":
             return await cls._send_via_ensend(
@@ -145,7 +203,7 @@ class EmailService:
         order: Order,
         new_status: str,
     ) -> bool:
-        """Sends transactional order update emails to order.guest_email upon state transitions."""
+        """Sends transactional order update emails upon state transitions."""
         normalized = new_status.lower().strip().replace(" ", "_")
         order_ref = order.order_reference
         customer_name = order.customer_name

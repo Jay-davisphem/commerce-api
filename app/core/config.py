@@ -69,7 +69,8 @@ class Settings(BaseSettings):
     CORS_ORIGINS: list[str] = Field(default_factory=lambda: ["http://localhost:3000"])
 
     # Email Dispatch Configuration
-    EMAIL_PROVIDER: str = "resend"  # "resend" or "ensend"
+    # Options: "console" (terminal output), "file" (local HTML files), "resend", "ensend"
+    EMAIL_PROVIDER: str = "console"
     EMAILS_FROM: str = "BLHMI Support <noreply@blhmisupplement.com>"
 
     # Resend Credentials
